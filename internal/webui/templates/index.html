@@ -1,0 +1,136 @@
+{{define "index.html"}}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>backup-stack</title>
+<style>
+  body { font: 14px/1.4 -apple-system, system-ui, sans-serif; margin: 2rem; color: #1a1a1a; }
+  h1 { font-size: 1.3rem; }
+  h2 { font-size: 1.05rem; margin-top: 2rem; }
+  table { border-collapse: collapse; width: 100%; margin-top: .5rem; }
+  th, td { text-align: left; padding: .35rem .6rem; border-bottom: 1px solid #ddd; }
+  .badge { display: inline-block; padding: .1rem .5rem; border-radius: .3rem; font-size: .85em; }
+  .badge-succeeded { background: #d7f0d7; }
+  .badge-running { background: #fff3cd; }
+  .badge-failed { background: #f8d7da; }
+  .badge-never { background: #eee; }
+  button, input[type=submit] { cursor: pointer; }
+  .hint { color: #666; font-size: .9em; }
+  form.inline { display: inline; }
+  #token-bar { margin-bottom: 1rem; }
+</style>
+</head>
+<body>
+<h1>backup-stack</h1>
+<p class="hint">Scheduled backup and cross-location sync for cloud-stack's infrastructure.</p>
+
+<div id="token-bar">
+  <span id="token-status" class="hint"></span>
+  <button type="button" onclick="setToken()">Set admin token</button>
+</div>
+
+<h2>Targets</h2>
+{{template "targets-list" .Targets}}
+
+<details>
+  <summary>Add target</summary>
+  <form id="target-form" onsubmit="return createTarget(event)">
+    <p><label>Name <input name="name" required></label></p>
+    <p><label>Type
+      <select name="type">
+        <option value="ssh-path">ssh-path</option>
+        <option value="k8s-namespace">k8s-namespace</option>
+      </select>
+    </label></p>
+    <p><label>Config (JSON) <input name="config" size="60" value="{}"></label></p>
+    <p><label>Sink <input name="sinkRef" placeholder="primary"></label></p>
+    <p><label>Schedule (cron, blank = manual only) <input name="schedule" placeholder="@daily"></label></p>
+    <p><input type="submit" value="Create target"></p>
+  </form>
+</details>
+
+<p><button type="button" onclick="discover()">Discover from cloud-stack</button>
+  <span class="hint">{{if not .CloudStack}}(not configured){{end}}</span></p>
+<pre id="discover-out"></pre>
+
+<h2>Sync jobs</h2>
+{{template "sync-jobs-list" .SyncJobs}}
+
+<script>
+function getToken() { return localStorage.getItem('backupStackToken') || ''; }
+function setToken() {
+  var t = prompt('Admin bearer token:', getToken());
+  if (t !== null) { localStorage.setItem('backupStackToken', t); renderTokenStatus(); }
+}
+function renderTokenStatus() {
+  document.getElementById('token-status').textContent = getToken() ? 'Token set.' : 'No token set — mutations will fail.';
+}
+function api(path, method) {
+  return fetch(path, { method: method || 'GET', headers: { 'Authorization': 'Bearer ' + getToken(), 'Content-Type': 'application/json' } });
+}
+function runNow(id) {
+  api('/v1/targets/' + encodeURIComponent(id) + ':run', 'POST').then(function (r) {
+    if (!r.ok) { return r.text().then(function (t) { alert('run failed: ' + t); }); }
+    location.reload();
+  });
+}
+function createTarget(ev) {
+  ev.preventDefault();
+  var f = ev.target;
+  var config;
+  try { config = JSON.parse(f.config.value || '{}'); } catch (e) { alert('config is not valid JSON'); return false; }
+  var body = { name: f.name.value, type: f.type.value, config: config, sinkRef: f.sinkRef.value, schedule: f.schedule.value };
+  fetch('/v1/targets', { method: 'POST', headers: { 'Authorization': 'Bearer ' + getToken(), 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    .then(function (r) {
+      if (!r.ok) { return r.text().then(function (t) { alert('create failed: ' + t); }); }
+      location.reload();
+    });
+  return false;
+}
+function discover() {
+  api('/v1/discover').then(function (r) { return r.json(); }).then(function (list) {
+    document.getElementById('discover-out').textContent = JSON.stringify(list, null, 2);
+  });
+}
+renderTokenStatus();
+</script>
+</body>
+</html>
+{{end}}
+
+{{define "targets-list"}}
+<table>
+<thead><tr><th>Name</th><th>Type</th><th>Schedule</th><th>Last run</th><th></th></tr></thead>
+<tbody>
+{{range .}}
+<tr>
+  <td>{{.Target.Name}}</td>
+  <td>{{.Target.Type}}</td>
+  <td>{{if .Target.Schedule}}{{.Target.Schedule}}{{else}}manual{{end}}</td>
+  <td><span class="badge badge-{{if .LastRun}}{{.LastRun.State}}{{else}}never{{end}}">{{statusBadge .}}</span></td>
+  <td><button type="button" onclick="runNow('{{.Target.ID}}')">Run now</button></td>
+</tr>
+{{else}}
+<tr><td colspan="5" class="hint">No targets yet.</td></tr>
+{{end}}
+</tbody>
+</table>
+{{end}}
+
+{{define "sync-jobs-list"}}
+<table>
+<thead><tr><th>Name</th><th>Schedule</th><th>Last run</th></tr></thead>
+<tbody>
+{{range .}}
+<tr>
+  <td>{{.Job.Name}}</td>
+  <td>{{if .Job.Schedule}}{{.Job.Schedule}}{{else}}manual{{end}}</td>
+  <td>{{if .Job.LastRunState}}{{.Job.LastRunState}}{{else}}never run{{end}}</td>
+</tr>
+{{else}}
+<tr><td colspan="3" class="hint">No sync jobs yet.</td></tr>
+{{end}}
+</tbody>
+</table>
+{{end}}
