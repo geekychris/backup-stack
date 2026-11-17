@@ -12,13 +12,13 @@ import (
 
 // S3Config configures an S3Store, one side of a sync (source or dest).
 type S3Config struct {
-	Endpoint     string
-	Region       string
-	Bucket       string
-	AccessKey    string
-	SecretKey    string
-	UseSSL       bool
-	CreateBucket bool
+	Endpoint     string `json:"endpoint"`
+	Region       string `json:"region"`
+	Bucket       string `json:"bucket"`
+	AccessKey    string `json:"accessKey"`
+	SecretKey    string `json:"secretKey"`
+	UseSSL       bool   `json:"useSSL"`
+	CreateBucket bool   `json:"createBucket"`
 }
 
 // S3Store is an ObjectStore backed by an S3-compatible (MinIO) bucket.
