@@ -148,6 +148,28 @@ func TestRunNow(t *testing.T) {
 	}
 }
 
+func TestRunNowConflictWhenInFlight(t *testing.T) {
+	s := newTestServer(t)
+	rec := doJSON(t, s, http.MethodPost, "/v1/targets", testToken, targetRequest{
+		Name: "t1", Type: store.TypeSSHPath, Config: json.RawMessage(`{}`),
+	})
+	var created store.Target
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.d.Store.CreateRun(context.Background(), &store.Run{
+		ID: "already-running", TargetID: created.ID, Kind: store.KindFull, State: store.StateRunning,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rec = doJSON(t, s, http.MethodPost, "/v1/targets/"+created.ID+":run", testToken, nil)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("run status = %d, body = %s, want 409", rec.Code, rec.Body.String())
+	}
+}
+
 func TestAuthRequired(t *testing.T) {
 	s := newTestServer(t)
 	if rec := doJSON(t, s, http.MethodGet, "/v1/targets", "", nil); rec.Code != http.StatusUnauthorized {

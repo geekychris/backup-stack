@@ -223,7 +223,10 @@ func (s *Server) deleteTarget(w http.ResponseWriter, r *http.Request) {
 // successful one, otherwise an incremental. It runs synchronously — at the
 // scale this tool targets, a request thread blocking for a backup to
 // finish is simpler than a job queue, and the caller's GET .../runs
-// immediately reflects the outcome.
+// immediately reflects the outcome. If the target already has a run in
+// progress (e.g. one the Scheduler just dispatched), Store.StartRun inside
+// RunFull/RunIncremental rejects the second one with store.ErrRunInFlight,
+// reported here as 409.
 func (s *Server) runTarget(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	id := chi.URLParam(r, "id")
@@ -255,6 +258,10 @@ func (s *Server) runTarget(w http.ResponseWriter, r *http.Request) {
 		run, err = s.d.Runner.RunIncremental(ctx, t.ID, src, sk)
 	}
 	if err != nil {
+		if errors.Is(err, store.ErrRunInFlight) {
+			writeError(w, http.StatusConflict, "target already has a run in progress")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
