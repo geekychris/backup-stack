@@ -29,9 +29,15 @@ type Item struct {
 	Size int64 `json:"size"`
 }
 
-// Catalog is everything a backup run captured.
+// Catalog is everything a backup run captured. A full run's Catalog has
+// every item that exists and an empty Deleted. An incremental run instead
+// stores a "delta catalog": Items holds only what it newly captured (the
+// added and changed items — a sink need only hold their content, not every
+// unchanged item's), and Deleted names what no longer exists. Apply turns
+// either shape into the full state it describes.
 type Catalog struct {
-	Items []Item `json:"items"`
+	Items   []Item   `json:"items"`
+	Deleted []string `json:"deleted,omitempty"`
 }
 
 // byPath returns the catalog's items indexed by Path.
@@ -43,12 +49,14 @@ func (c Catalog) byPath() map[string]Item {
 	return m
 }
 
-// Marshal encodes the catalog as JSON, items sorted by Path so two catalogs
-// with the same items always encode identically.
+// Marshal encodes the catalog as JSON, items and deleted paths sorted so
+// two catalogs with the same contents always encode identically.
 func (c Catalog) Marshal() ([]byte, error) {
 	sorted := append([]Item{}, c.Items...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Path < sorted[j].Path })
-	return json.Marshal(Catalog{Items: sorted})
+	deleted := append([]string{}, c.Deleted...)
+	sort.Strings(deleted)
+	return json.Marshal(Catalog{Items: sorted, Deleted: deleted})
 }
 
 // Unmarshal decodes a catalog written by Marshal.
@@ -91,20 +99,30 @@ func Diff(prev, cur Catalog) Delta {
 	return d
 }
 
-// Apply replays a Delta onto base to produce the catalog it was computed
-// against (base's items with Added appended, Changed replacing their old
-// entry, and Deleted entries removed). Chaining Apply over a run of
-// incremental Deltas, in the order they were taken, reconstructs the final
-// catalog without needing every intermediate run's full item list.
-func Apply(base Catalog, d Delta) Catalog {
+// AsCatalog turns a Delta into the delta-shaped Catalog a run's sink stores:
+// Items is Added and Changed combined (Apply treats both as an upsert, so
+// nothing is lost by not keeping them separate), and Deleted carries over
+// unchanged.
+func (d Delta) AsCatalog() Catalog {
+	items := make([]Item, 0, len(d.Added)+len(d.Changed))
+	items = append(items, d.Added...)
+	items = append(items, d.Changed...)
+	return Catalog{Items: items, Deleted: d.Deleted}
+}
+
+// Apply overlays onto base to produce the full catalog it describes:
+// base's items with overlay.Items upserted and overlay.Deleted's paths
+// removed. overlay may be a full snapshot (Deleted empty, Items being
+// everything) or a delta catalog (Items being only what changed). Chaining
+// Apply over a run of incremental runs' delta catalogs, in the order they
+// were taken, reconstructs the final state without needing every
+// intermediate run to have stored every unchanged item.
+func Apply(base, overlay Catalog) Catalog {
 	byPath := base.byPath()
-	for _, it := range d.Added {
+	for _, it := range overlay.Items {
 		byPath[it.Path] = it
 	}
-	for _, it := range d.Changed {
-		byPath[it.Path] = it
-	}
-	for _, p := range d.Deleted {
+	for _, p := range overlay.Deleted {
 		delete(byPath, p)
 	}
 	out := Catalog{Items: make([]Item, 0, len(byPath))}

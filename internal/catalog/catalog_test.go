@@ -112,12 +112,29 @@ func TestCatalogMarshalRoundTrip(t *testing.T) {
 func TestApplyReplayAppliesDiffInOrder(t *testing.T) {
 	base := Catalog{Items: []Item{item("a", "1", 1), item("b", "2", 2)}}
 	d1 := Diff(base, Catalog{Items: []Item{item("a", "1", 1), item("b", "3", 2), item("c", "1", 1)}})
-	step1 := Apply(base, d1)
+	step1 := Apply(base, d1.AsCatalog())
 	d2 := Diff(step1, Catalog{Items: []Item{item("a", "1", 1), item("c", "1", 1)}})
-	step2 := Apply(step1, d2)
+	step2 := Apply(step1, d2.AsCatalog())
 
 	want := []string{"a", "c"}
 	if got := names(step2.Items); !reflect.DeepEqual(got, want) {
 		t.Fatalf("replayed catalog = %v, want %v", got, want)
+	}
+}
+
+func TestDeltaAsCatalogAndApplyHandleDeletes(t *testing.T) {
+	base := Catalog{Items: []Item{item("a", "1", 1), item("b", "2", 2)}}
+	cur := Catalog{Items: []Item{item("a", "1", 1), item("c", "3", 1)}} // b deleted, c added
+	d := Diff(base, cur)
+	deltaCat := d.AsCatalog()
+	if len(deltaCat.Items) != 1 || deltaCat.Items[0].Path != "c" {
+		t.Fatalf("delta catalog items = %+v, want just c", deltaCat.Items)
+	}
+	if len(deltaCat.Deleted) != 1 || deltaCat.Deleted[0] != "b" {
+		t.Fatalf("delta catalog deleted = %v, want [b]", deltaCat.Deleted)
+	}
+	got := Apply(base, deltaCat)
+	if want := names(cur.Items); !reflect.DeepEqual(names(got.Items), want) {
+		t.Fatalf("applied = %v, want %v", names(got.Items), want)
 	}
 }
