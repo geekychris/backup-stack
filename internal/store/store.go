@@ -260,6 +260,44 @@ func (s *Store) CreateRun(ctx context.Context, r *Run) error {
 	return err
 }
 
+// ErrRunInFlight is returned by StartRun when the target already has a run
+// in state "running". Two concurrent starts for the same target (e.g. the
+// Scheduler dispatching one while a manual "run now" is also requested)
+// would otherwise both diff against the same prior catalog and write
+// overlapping delta catalogs, corrupting what a later restore reconstructs.
+var ErrRunInFlight = errors.New("target already has a run in progress")
+
+// StartRun atomically checks that r.TargetID has no in-flight run and
+// inserts r (which must already be in StateRunning), inside one
+// transaction, so two callers racing to start a run for the same target can
+// never both pass the check: whichever commits first wins, and the other
+// gets ErrRunInFlight.
+func (s *Store) StartRun(ctx context.Context, r *Run) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: start run: begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	var n int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(1) FROM runs WHERE target_id=? AND state=?`, r.TargetID, StateRunning).Scan(&n); err != nil {
+		return fmt.Errorf("store: start run: check in-flight: %w", err)
+	}
+	if n > 0 {
+		return ErrRunInFlight
+	}
+	if r.StartedAt.IsZero() {
+		r.StartedAt = s.now()
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO runs
+		(id, target_id, kind, state, item_count, error, started_at, finished_at)
+		VALUES (?,?,?,?,?,?,?,?)`,
+		r.ID, r.TargetID, r.Kind, r.State, r.ItemCount, r.Error, ts(r.StartedAt), tsp(r.FinishedAt)); err != nil {
+		return fmt.Errorf("store: start run: insert: %w", err)
+	}
+	return tx.Commit()
+}
+
 const runCols = `id, target_id, kind, state, item_count, error, started_at, finished_at`
 
 func scanRun(row interface{ Scan(...any) error }) (*Run, error) {
@@ -325,6 +363,25 @@ func (s *Store) FinishRun(ctx context.Context, id, state string, itemCount int, 
 		return err
 	}
 	return checkAffected(res)
+}
+
+// ReconcileStaleRuns marks every run still in state "running" as failed.
+// Call this once, at process startup before dispatching any new runs: a
+// "running" row left behind by an unclean shutdown or crash has no process
+// actually working on it, yet DueTargets/hasInFlightRun treat any running
+// row as blocking that target from ever being scheduled again — without
+// this, such a row would stall the target's schedule forever.
+func (s *Store) ReconcileStaleRuns(ctx context.Context) (int, error) {
+	res, err := s.db.ExecContext(ctx, `UPDATE runs SET state=?, error=?, finished_at=? WHERE state=?`,
+		StateFailed, "interrupted: process restarted before run finished", ts(s.now()), StateRunning)
+	if err != nil {
+		return 0, fmt.Errorf("store: reconcile stale runs: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("store: reconcile stale runs: %w", err)
+	}
+	return int(n), nil
 }
 
 // hasInFlightRun reports whether a target has a run in state "running".

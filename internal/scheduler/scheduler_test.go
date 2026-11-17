@@ -141,3 +141,48 @@ func TestSchedulerConcurrencyCap(t *testing.T) {
 		t.Fatalf("max concurrent exceeded cap: %d > %d", got, n)
 	}
 }
+
+// TestSchedulerWaitBlocksUntilDispatchedRunsFinish proves Wait doesn't
+// return just because RunLoop stopped polling: it must also block until
+// every goroutine dispatch started has actually returned. This is what
+// cmd/backup-stack's serve relies on to avoid closing the Store while a
+// scheduler-dispatched backup is still writing to it.
+func TestSchedulerWaitBlocksUntilDispatchedRunsFinish(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	dueTarget(t, st, "t1")
+
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+	sched := &Scheduler{
+		Store: st,
+		Now:   func() time.Time { return time.Now() },
+		Run: func(ctx context.Context, tgt *store.Target) error {
+			started <- struct{}{}
+			<-release
+			return nil
+		},
+	}
+
+	sched.Poll(ctx)
+	<-started
+
+	waitReturned := make(chan struct{})
+	go func() {
+		sched.Wait()
+		close(waitReturned)
+	}()
+
+	select {
+	case <-waitReturned:
+		t.Fatal("Wait returned while the dispatched run was still in flight")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case <-waitReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait did not return within 2s of the dispatched run finishing")
+	}
+}

@@ -16,6 +16,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/geekychris/backup-stack/internal/catalog"
 	"github.com/geekychris/backup-stack/internal/sink"
@@ -44,6 +45,17 @@ func (r *Runner) newRunID() string {
 	return "run_" + hex.EncodeToString(b)
 }
 
+// finishRun records a run's outcome using a short-lived context detached
+// from the caller's: a run whose actual work (snapshot/write) is already
+// done must still be flipped out of state "running" even if the caller's
+// ctx was canceled mid-run (e.g. by a shutdown), or its row blocks that
+// target's schedule forever — see store.DueTargets.
+func (r *Runner) finishRun(id, state string, itemCount int, errMsg string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return r.Store.FinishRun(ctx, id, state, itemCount, errMsg)
+}
+
 // RunFull captures everything src currently reports: every item's content
 // goes to sk, and sk's catalog for this run is the complete snapshot.
 func (r *Runner) RunFull(ctx context.Context, targetID string, src source.Source, sk sink.Sink) (*store.Run, error) {
@@ -52,18 +64,18 @@ func (r *Runner) RunFull(ctx context.Context, targetID string, src source.Source
 		return nil, fmt.Errorf("backup: snapshot: %w", err)
 	}
 	run := &store.Run{ID: r.newRunID(), TargetID: targetID, Kind: store.KindFull, State: store.StateRunning}
-	if err := r.Store.CreateRun(ctx, run); err != nil {
-		return nil, fmt.Errorf("backup: create run: %w", err)
+	if err := r.Store.StartRun(ctx, run); err != nil {
+		return nil, fmt.Errorf("backup: start run: %w", err)
 	}
 	if err := writeItems(ctx, run.ID, src, sk, snap.Items); err != nil {
-		_ = r.Store.FinishRun(ctx, run.ID, store.StateFailed, 0, err.Error())
+		_ = r.finishRun(run.ID, store.StateFailed, 0, err.Error())
 		return nil, err
 	}
 	if err := sk.WriteCatalog(ctx, run.ID, snap); err != nil {
-		_ = r.Store.FinishRun(ctx, run.ID, store.StateFailed, 0, err.Error())
+		_ = r.finishRun(run.ID, store.StateFailed, 0, err.Error())
 		return nil, fmt.Errorf("backup: write catalog: %w", err)
 	}
-	if err := r.Store.FinishRun(ctx, run.ID, store.StateSucceeded, len(snap.Items), ""); err != nil {
+	if err := r.finishRun(run.ID, store.StateSucceeded, len(snap.Items), ""); err != nil {
 		return nil, err
 	}
 	return r.Store.GetRun(ctx, run.ID)
@@ -95,18 +107,18 @@ func (r *Runner) RunIncremental(ctx context.Context, targetID string, src source
 	deltaCat := delta.AsCatalog()
 
 	run := &store.Run{ID: r.newRunID(), TargetID: targetID, Kind: store.KindIncremental, State: store.StateRunning}
-	if err := r.Store.CreateRun(ctx, run); err != nil {
-		return nil, fmt.Errorf("backup: create run: %w", err)
+	if err := r.Store.StartRun(ctx, run); err != nil {
+		return nil, fmt.Errorf("backup: start run: %w", err)
 	}
 	if err := writeItems(ctx, run.ID, src, sk, deltaCat.Items); err != nil {
-		_ = r.Store.FinishRun(ctx, run.ID, store.StateFailed, 0, err.Error())
+		_ = r.finishRun(run.ID, store.StateFailed, 0, err.Error())
 		return nil, err
 	}
 	if err := sk.WriteCatalog(ctx, run.ID, deltaCat); err != nil {
-		_ = r.Store.FinishRun(ctx, run.ID, store.StateFailed, 0, err.Error())
+		_ = r.finishRun(run.ID, store.StateFailed, 0, err.Error())
 		return nil, fmt.Errorf("backup: write catalog: %w", err)
 	}
-	if err := r.Store.FinishRun(ctx, run.ID, store.StateSucceeded, len(deltaCat.Items), ""); err != nil {
+	if err := r.finishRun(run.ID, store.StateSucceeded, len(deltaCat.Items), ""); err != nil {
 		return nil, err
 	}
 	return r.Store.GetRun(ctx, run.ID)

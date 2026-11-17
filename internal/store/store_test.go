@@ -125,3 +125,86 @@ func TestDueTargets(t *testing.T) {
 		}
 	}
 }
+
+func TestStartRunRejectsConcurrent(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	tgt := &Target{ID: "t1", Name: "t1", Type: TypeSSHPath, Config: []byte(`{}`)}
+	if err := s.CreateTarget(ctx, tgt); err != nil {
+		t.Fatal(err)
+	}
+
+	first := &Run{ID: "r1", TargetID: "t1", Kind: KindFull, State: StateRunning}
+	if err := s.StartRun(ctx, first); err != nil {
+		t.Fatalf("first StartRun: %v", err)
+	}
+
+	second := &Run{ID: "r2", TargetID: "t1", Kind: KindFull, State: StateRunning}
+	if err := s.StartRun(ctx, second); !errors.Is(err, ErrRunInFlight) {
+		t.Fatalf("second StartRun = %v, want ErrRunInFlight", err)
+	}
+	if _, err := s.GetRun(ctx, "r2"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("rejected run should not have been inserted, got %v", err)
+	}
+
+	// Once the first run finishes, a new StartRun must succeed again.
+	if err := s.FinishRun(ctx, "r1", StateSucceeded, 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	third := &Run{ID: "r3", TargetID: "t1", Kind: KindIncremental, State: StateRunning}
+	if err := s.StartRun(ctx, third); err != nil {
+		t.Fatalf("StartRun after prior run finished: %v", err)
+	}
+}
+
+func TestReconcileStaleRuns(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	tgt := &Target{ID: "t1", Name: "t1", Type: TypeSSHPath, Config: []byte(`{}`), Enabled: true}
+	if err := s.CreateTarget(ctx, tgt); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateRun(ctx, &Run{ID: "stale", TargetID: "t1", Kind: KindFull, State: StateRunning}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateRun(ctx, &Run{ID: "done", TargetID: "t1", Kind: KindFull, State: StateSucceeded}); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := s.ReconcileStaleRuns(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("ReconcileStaleRuns reported %d rows, want 1", n)
+	}
+
+	stale, err := s.GetRun(ctx, "stale")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stale.State != StateFailed || stale.Error == "" || stale.FinishedAt == nil {
+		t.Fatalf("stale run after reconcile = %+v", stale)
+	}
+	done, err := s.GetRun(ctx, "done")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done.State != StateSucceeded {
+		t.Fatalf("already-finished run was touched by reconcile: %+v", done)
+	}
+
+	// A target whose only run is now "failed" (not "running") must become
+	// due again, proving reconciliation actually unblocks its schedule.
+	tgt.Schedule = "@hourly"
+	if err := s.UpdateTarget(ctx, tgt); err != nil {
+		t.Fatal(err)
+	}
+	due, err := s.DueTargets(ctx, stale.FinishedAt.Add(2*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 1 || due[0].ID != "t1" {
+		t.Fatalf("due = %+v, want [t1]", due)
+	}
+}

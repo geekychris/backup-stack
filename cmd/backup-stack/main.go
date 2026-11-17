@@ -191,6 +191,11 @@ func cmdServe(ctx context.Context, args []string) error {
 		return err
 	}
 	defer st.Close()
+	if n, err := st.ReconcileStaleRuns(ctx); err != nil {
+		return fmt.Errorf("reconcile stale runs: %w", err)
+	} else if n > 0 {
+		slog.Warn("backup-stack: marked stale in-flight runs as failed on startup", "count", n)
+	}
 
 	sinks, err := sinksConfig()
 	if err != nil {
@@ -239,10 +244,21 @@ func cmdServe(ctx context.Context, args []string) error {
 		},
 		Logger: slog.Default(),
 	}
-	go sched.RunLoop(runCtx)
+	// schedStopped closes once RunLoop has returned (ctx canceled) and every
+	// run it dispatched has actually finished, so the caller below can wait
+	// for that before defer st.Close() fires — otherwise a scheduler-
+	// dispatched backup could still be writing to the Store after it closes.
+	schedStopped := make(chan struct{})
+	go func() {
+		defer close(schedStopped)
+		sched.RunLoop(runCtx)
+		sched.Wait()
+	}()
 
 	srv := &http.Server{Addr: *addr, Handler: mux}
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-runCtx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -251,6 +267,14 @@ func cmdServe(ctx context.Context, args []string) error {
 	slog.Info("backup-stack: listening", "addr", *addr)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
+	}
+	<-shutdownDone
+
+	const schedGrace = 30 * time.Second
+	select {
+	case <-schedStopped:
+	case <-time.After(schedGrace):
+		slog.Warn("backup-stack: scheduler and in-flight runs did not stop within grace period; exiting anyway", "grace", schedGrace)
 	}
 	return nil
 }

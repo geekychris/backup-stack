@@ -170,6 +170,23 @@ func TestRunFull(t *testing.T) {
 	}
 }
 
+func TestRunFullRejectsWhenAlreadyInFlight(t *testing.T) {
+	ctx := context.Background()
+	r, st := newTestRunner(t)
+	createTarget(t, st, "t1")
+	if err := st.CreateRun(ctx, &store.Run{ID: "already-running", TargetID: "t1", Kind: store.KindFull, State: store.StateRunning}); err != nil {
+		t.Fatal(err)
+	}
+
+	src := newFakeSource()
+	src.Set("a.txt", []byte("aaa"))
+	sk := newFakeSink()
+
+	if _, err := r.RunFull(ctx, "t1", src, sk); !errors.Is(err, store.ErrRunInFlight) {
+		t.Fatalf("RunFull while a run is in flight = %v, want ErrRunInFlight", err)
+	}
+}
+
 func TestRunIncrementalWithNoPriorFull(t *testing.T) {
 	ctx := context.Background()
 	r, st := newTestRunner(t)

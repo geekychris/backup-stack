@@ -39,6 +39,7 @@ type Scheduler struct {
 	mu       sync.Mutex
 	inFlight map[string]bool
 	sem      chan struct{}
+	wg       sync.WaitGroup
 }
 
 func (s *Scheduler) now() time.Time {
@@ -97,7 +98,9 @@ func (s *Scheduler) Poll(ctx context.Context) {
 // dispatch marks t in-flight synchronously (so the very next Poll call,
 // even one made before this target's goroutine is scheduled, sees it as
 // busy) and starts a goroutine that releases the mark and the concurrency
-// slot when RunFunc returns, or if ctx ends before a slot frees up.
+// slot when RunFunc returns, or if ctx ends before a slot frees up. The
+// goroutine is tracked by s.wg so Wait can observe when every dispatched
+// run has actually finished, not just when RunLoop stopped polling.
 func (s *Scheduler) dispatch(ctx context.Context, t *store.Target) {
 	s.mu.Lock()
 	if s.inFlight[t.ID] {
@@ -107,7 +110,9 @@ func (s *Scheduler) dispatch(ctx context.Context, t *store.Target) {
 	s.inFlight[t.ID] = true
 	s.mu.Unlock()
 
+	s.wg.Add(1)
 	go func() {
+		defer s.wg.Done()
 		defer func() {
 			s.mu.Lock()
 			delete(s.inFlight, t.ID)
@@ -123,4 +128,14 @@ func (s *Scheduler) dispatch(ctx context.Context, t *store.Target) {
 			s.Logger.Warn("scheduler: run", "target", t.ID, "err", err)
 		}
 	}()
+}
+
+// Wait blocks until every run dispatch has returned, including ones still
+// in flight when RunLoop's ctx was canceled. Callers that need shutdown to
+// be bounded (e.g. cmd/backup-stack's serve) should wrap this in their own
+// timeout, since a RunFunc that ignores ctx cancellation could otherwise
+// make Wait block indefinitely.
+func (s *Scheduler) Wait() {
+	s.init()
+	s.wg.Wait()
 }
