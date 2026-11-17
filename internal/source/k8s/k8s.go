@@ -31,8 +31,8 @@ type Config struct {
 	Client kubernetes.Interface
 	// Namespaces to back up.
 	Namespaces []string
-	// ExcludeKinds omits a kind ("ConfigMap", "Secret", "Deployment",
-	// "Service", "StatefulSet", "DaemonSet") from the backup. Secrets are
+	// ExcludeKinds omits a kind ("ConfigMap", "Secret", "Deployment") from
+	// the backup — the only kinds Snapshot/Open ever capture. Secrets are
 	// included by default: a backup that can't restore them isn't useful
 	// for disaster recovery, even though that means secret material is at
 	// rest wherever the Sink stores it.

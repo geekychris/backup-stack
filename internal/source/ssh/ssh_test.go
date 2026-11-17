@@ -4,12 +4,14 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"io"
 	"net"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	xssh "golang.org/x/crypto/ssh"
 
@@ -25,6 +27,10 @@ type fakeServer struct {
 	mu           sync.Mutex
 	fileListing  []listEntry
 	fileContents map[string][]byte
+	// hang marks paths whose "cat" never completes on its own: handleExec
+	// blocks until the client closes its side of the channel, simulating a
+	// wedged remote command.
+	hang         map[string]bool
 	addr         string
 	clientSigner xssh.Signer
 	hostSigner   xssh.Signer
@@ -43,7 +49,7 @@ func newFakeServer(t *testing.T) *fakeServer {
 	_, hostPriv, _ := ed25519.GenerateKey(rand.Reader)
 	hostSigner, _ := xssh.NewSignerFromKey(hostPriv)
 
-	fs := &fakeServer{fileContents: map[string][]byte{}, clientSigner: clientSigner, hostSigner: hostSigner}
+	fs := &fakeServer{fileContents: map[string][]byte{}, hang: map[string]bool{}, clientSigner: clientSigner, hostSigner: hostSigner}
 
 	cfg := &xssh.ServerConfig{PublicKeyCallback: func(_ xssh.ConnMetadata, k xssh.PublicKey) (*xssh.Permissions, error) {
 		if string(k.Marshal()) == string(clientSigner.PublicKey().Marshal()) {
@@ -102,14 +108,25 @@ func (fs *fakeServer) serve(c net.Conn, cfg *xssh.ServerConfig) {
 }
 
 func (fs *fakeServer) handleExec(ch xssh.Channel, cmd string) {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
 	if strings.HasPrefix(cmd, catCommandPrefix) {
 		path := strings.TrimPrefix(cmd, catCommandPrefix)
 		path = strings.Trim(path, "'")
-		_, _ = ch.Write(fs.fileContents[path])
+		fs.mu.Lock()
+		hang := fs.hang[path]
+		content := fs.fileContents[path]
+		fs.mu.Unlock()
+		if hang {
+			// Block until the client closes its side of the channel (e.g.
+			// because ctx was canceled and the caller gave up waiting),
+			// simulating a remote command that never exits on its own.
+			_, _ = io.Copy(io.Discard, ch)
+			return
+		}
+		_, _ = ch.Write(content)
 		return
 	}
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
 	var b strings.Builder
 	for _, e := range fs.fileListing {
 		b.WriteString(e.path)
@@ -126,6 +143,12 @@ func (fs *fakeServer) setListing(entries []listEntry) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	fs.fileListing = entries
+}
+
+func (fs *fakeServer) setHang(path string) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	fs.hang[path] = true
 }
 
 func newSource(t *testing.T, fs *fakeServer, path string) *Source {
@@ -196,5 +219,34 @@ func TestSSHSourceOpen(t *testing.T) {
 	}
 	if string(got) != "hello world" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+// TestSSHSourceOpenCloseAbortsOnContextCancel proves that Close on the
+// reader returned by Open doesn't hang forever when the remote command
+// never exits on its own (e.g. a wedged `cat`): canceling ctx must make
+// Close return promptly, not block on the blocking ssh.Session.Wait call.
+func TestSSHSourceOpenCloseAbortsOnContextCancel(t *testing.T) {
+	fs := newFakeServer(t)
+	fs.setHang("/data/wedged.txt")
+	src := newSource(t, fs, "/data")
+	defer src.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	r, err := src.Open(ctx, "wedged.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+
+	closeErr := make(chan error, 1)
+	go func() { closeErr <- r.Close() }()
+	select {
+	case err := <-closeErr:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Close() err = %v, want context.Canceled", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close() did not return within 3s of ctx cancellation; it hung on the wedged remote command")
 	}
 }

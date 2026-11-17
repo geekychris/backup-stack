@@ -201,7 +201,23 @@ func (r *sessionReader) Read(p []byte) (int, error) {
 	return r.r.Read(p)
 }
 
+// Close waits for the remote command to finish, same as runWithContext does
+// for Snapshot: if ctx ends first, it closes the session to force the
+// pending Wait to return rather than blocking forever on a wedged remote
+// command. The remote command's own exit status is intentionally ignored
+// (as before this fix) — only Close's own error is returned.
 func (r *sessionReader) Close() error {
-	_ = r.sess.Wait()
-	return r.sess.Close()
+	waitDone := make(chan struct{})
+	go func() {
+		_ = r.sess.Wait()
+		close(waitDone)
+	}()
+	select {
+	case <-r.ctx.Done():
+		_ = r.sess.Close()
+		<-waitDone
+		return r.ctx.Err()
+	case <-waitDone:
+		return r.sess.Close()
+	}
 }
