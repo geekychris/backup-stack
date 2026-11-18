@@ -1,0 +1,174 @@
+# backup-stack on spark (microk8s), namespace backup. Applied by
+# scripts/deploy-spark.sh, which substitutes @IMAGE@ and @STORAGE_CLASS@.
+#
+# Secrets (never in this file; scripts/deploy-spark.sh only checks for them):
+#   backup-stack-env (required), as env vars:
+#     BACKUP_STACK_TOKEN          the API/UI bearer token (cloud-stack's app proxy sends it)
+#     BACKUP_STACK_S3_ACCESS_KEY  credentials for the "primary" sink
+#     BACKUP_STACK_S3_SECRET_KEY
+#     optional: BACKUP_STACK_SINKS_JSON (several named sinks, replaces the
+#     BACKUP_STACK_S3_* shorthand), CLOUDSTACK_TOKEN (infra discovery),
+#     or any BACKUP_STACK_S3_* to override the ConfigMap below.
+#   backup-stack-ssh (optional): id_ed25519 + known_hosts for ssh-path targets
+#     and ssh sync endpoints, mounted at /etc/backup-stack/ssh.
+#   backup-stack-kubeconfigs (optional): kubeconfig files for other clusters'
+#     k8s-namespace targets ("kubeconfigPath": "/etc/backup-stack/kube/<file>");
+#     spark itself is reached in-cluster with the ServiceAccount below.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: backup
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backup-stack-config
+  namespace: backup
+data:
+  # The default sink, "primary": the lab's MinIO on wopr (credentials in
+  # backup-stack-env). Pods resolve .local names through cloud-stack's
+  # mDNS bridge (deploy/local-dns in cloud_stack).
+  BACKUP_STACK_S3_ENDPOINT: "http://wopr.local:9010"
+  BACKUP_STACK_S3_BUCKET: "lab-backups"
+  BACKUP_STACK_S3_CREATE_BUCKET: "true"
+  # Candidate discovery from cloud-stack's infra registry (GET /v1/infra).
+  CLOUDSTACK_URL: "http://cloudstack-api.cloudstack.svc.cluster.local:8080"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: backup-stack-data
+  namespace: backup
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: @STORAGE_CLASS@
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: backup-stack
+  namespace: backup
+---
+# Read-only access to namespaced objects cluster-wide, Secrets included, so
+# a k8s-namespace target can back up spark's own namespaces in-cluster.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: backup-stack-reader
+rules:
+  - apiGroups: [""]
+    resources: [namespaces, configmaps, secrets, services, serviceaccounts, persistentvolumeclaims]
+    verbs: [get, list]
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets, daemonsets]
+    verbs: [get, list]
+  - apiGroups: [batch]
+    resources: [jobs, cronjobs]
+    verbs: [get, list]
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses, networkpolicies]
+    verbs: [get, list]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [roles, rolebindings]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: backup-stack-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: backup-stack-reader
+subjects:
+  - kind: ServiceAccount
+    name: backup-stack
+    namespace: backup
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backup-stack
+  namespace: backup
+  labels: {app: backup-stack}
+spec:
+  replicas: 1
+  # One writer on the SQLite volume, one scheduler: never two pods at once.
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: backup-stack}
+  template:
+    metadata:
+      labels: {app: backup-stack}
+    spec:
+      serviceAccountName: backup-stack
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        runAsNonRoot: true
+      containers:
+        - name: backup-stack
+          image: @IMAGE@
+          imagePullPolicy: IfNotPresent
+          args: [serve]
+          ports:
+            - {name: http, containerPort: 8481}
+          envFrom:
+            - configMapRef: {name: backup-stack-config}
+            # Later sources win: the Secret can override the ConfigMap.
+            - secretRef: {name: backup-stack-env}
+          env:
+            - {name: BACKUP_STACK_DB, value: /data/backup-stack.db}
+            - {name: BACKUP_STACK_ADDR, value: ":8481"}
+            - {name: HOME, value: /data}
+            - {name: TMPDIR, value: /tmp}
+            # Used when an ssh target/endpoint doesn't name its own.
+            - {name: BACKUP_STACK_SSH_KEY, value: /etc/backup-stack/ssh/id_ed25519}
+            - {name: BACKUP_STACK_SSH_KNOWN_HOSTS, value: /etc/backup-stack/ssh/known_hosts}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: tmp, mountPath: /tmp}
+            - {name: ssh, mountPath: /etc/backup-stack/ssh, readOnly: true}
+            - {name: kube, mountPath: /etc/backup-stack/kube, readOnly: true}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 1Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: backup-stack-data}
+        - name: tmp
+          emptyDir: {}
+        # 0440, root-owned, group 65532 (fsGroup): readable by the service,
+        # and OpenSSH accepts a key it doesn't own as long as others can't read it.
+        - name: ssh
+          secret: {secretName: backup-stack-ssh, optional: true, defaultMode: 0440}
+        - name: kube
+          secret: {secretName: backup-stack-kubeconfigs, optional: true, defaultMode: 0440}
+---
+# The UI and API on the LAN (bearer token, or cloud-stack's app proxy, which
+# reaches it in-cluster at backup-stack.backup.svc.cluster.local:8481).
+apiVersion: v1
+kind: Service
+metadata:
+  name: backup-stack
+  namespace: backup
+spec:
+  type: NodePort
+  selector: {app: backup-stack}
+  ports:
+    - {name: http, port: 8481, targetPort: http, nodePort: 30922}

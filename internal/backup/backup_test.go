@@ -164,6 +164,9 @@ func TestRunFull(t *testing.T) {
 	if len(sk.items[run.ID]) != 2 {
 		t.Fatalf("sink wrote %d items, want 2", len(sk.items[run.ID]))
 	}
+	if run.Stats.Files != 2 || run.Stats.Bytes != 6 || run.Stats.Errors != 0 || run.FinishedAt == nil {
+		t.Fatalf("run stats = %+v", run.Stats)
+	}
 	cat := sk.catalogs[run.ID]
 	if len(cat.Items) != 2 || len(cat.Deleted) != 0 {
 		t.Fatalf("catalog = %+v", cat)
@@ -235,6 +238,9 @@ func TestRunIncrementalChain(t *testing.T) {
 	}
 	if inc1.Kind != store.KindIncremental || inc1.ItemCount != 1 {
 		t.Fatalf("inc1 = %+v", inc1)
+	}
+	if inc1.Stats.Files != 1 || inc1.Stats.Bytes != 4 || inc1.Stats.Skipped != 1 {
+		t.Fatalf("inc1 stats = %+v", inc1.Stats)
 	}
 	if got := itemPaths(sk.catalogs[inc1.ID].Items); !equalStrs(got, []string{"a.txt"}) {
 		t.Fatalf("inc1 catalog items = %v, want [a.txt]", got)

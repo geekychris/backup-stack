@@ -4,16 +4,21 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/geekychris/backup-stack/internal/backup"
 	"github.com/geekychris/backup-stack/internal/catalog"
 	"github.com/geekychris/backup-stack/internal/sink"
 	"github.com/geekychris/backup-stack/internal/source"
 	"github.com/geekychris/backup-stack/internal/store"
+	syncpkg "github.com/geekychris/backup-stack/internal/sync"
 )
 
 // fakeSource/fakeSink are minimal no-op implementations so runTarget has
@@ -61,6 +66,7 @@ func newTestServer(t *testing.T) *Server {
 		ResolveSink: func(*store.Target) (sink.Sink, error) {
 			return sk, nil
 		},
+		Sync:  &syncpkg.Runner{Store: st},
 		Token: testToken,
 	})
 }
@@ -180,5 +186,127 @@ func TestAuthRequired(t *testing.T) {
 	}
 	if rec := doJSON(t, s, http.MethodGet, "/v1/targets", testToken, nil); rec.Code != http.StatusOK {
 		t.Fatalf("correct token: status = %d", rec.Code)
+	}
+}
+
+func TestHealthzNoAuth(t *testing.T) {
+	s := newTestServer(t)
+	if rec := doJSON(t, s, http.MethodGet, "/healthz", "", nil); rec.Code != http.StatusOK || rec.Body.String() != "ok" {
+		t.Fatalf("healthz = %d %q", rec.Code, rec.Body.String())
+	}
+	s.d.Store.Close()
+	if rec := doJSON(t, s, http.MethodGet, "/healthz", "", nil); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("healthz with closed store = %d, want 503", rec.Code)
+	}
+}
+
+func TestSyncJobValidation(t *testing.T) {
+	s := newTestServer(t)
+	bad := []map[string]any{
+		{"name": "x", "sourceConfig": json.RawMessage(`{"type":"dir","path":"/a"}`), "destConfig": json.RawMessage(`{"type":"dir","path":"/a"}`)},
+		{"name": "x", "sourceConfig": json.RawMessage(`{"type":"dir","path":"rel"}`), "destConfig": json.RawMessage(`{"type":"dir","path":"/b"}`)},
+		{"name": "x", "sourceConfig": json.RawMessage(`{"type":"dir","path":"/a"}`), "destConfig": json.RawMessage(`{"type":"dir","path":"/b"}`),
+			"filters": []map[string]string{{"kind": "maybe", "pattern": "*"}}},
+	}
+	for i, b := range bad {
+		if rec := doJSON(t, s, http.MethodPost, "/v1/sync-jobs", testToken, b); rec.Code != http.StatusBadRequest {
+			t.Errorf("case %d: status %d, body %s", i, rec.Code, rec.Body.String())
+		}
+	}
+	if rec := doJSON(t, s, http.MethodPost, "/v1/targets", testToken, targetRequest{
+		Name: "t", Type: store.TypeSSHPath, Config: json.RawMessage(`{"filters":[{"kind":"exclude","pattern":""}]}`),
+	}); rec.Code != http.StatusBadRequest {
+		t.Errorf("target with empty filter pattern: %d", rec.Code)
+	}
+}
+
+func TestSyncJobRunHistoryAndStats(t *testing.T) {
+	s := newTestServer(t)
+	srcDir, dstDir := t.TempDir(), t.TempDir()
+	for name, content := range map[string]string{"a.txt": "12345", "b.tmp": "x", "sub/c.txt": "123"} {
+		p := filepath.Join(srcDir, name)
+		_ = os.MkdirAll(filepath.Dir(p), 0o755)
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rec := doJSON(t, s, http.MethodPost, "/v1/sync-jobs", testToken, map[string]any{
+		"name":         "local-mirror",
+		"sourceConfig": json.RawMessage(fmt.Sprintf(`{"type":"dir","path":%q}`, srcDir)),
+		"destConfig":   json.RawMessage(fmt.Sprintf(`{"type":"dir","path":%q}`, dstDir)),
+		"filters":      []map[string]string{{"kind": "exclude", "pattern": "*.tmp"}},
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create = %d %s", rec.Code, rec.Body.String())
+	}
+	var job struct {
+		ID     string `json:"id"`
+		Kind   string `json:"kind"`
+		Delete bool   `json:"delete"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &job)
+	if job.Kind != "dir->dir" || job.Delete {
+		t.Fatalf("job = %+v (delete must default off)", job)
+	}
+
+	rec = doJSON(t, s, http.MethodPost, "/v1/sync-jobs/"+job.ID+":run", testToken, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("run = %d %s", rec.Code, rec.Body.String())
+	}
+	var run store.SyncRun
+	_ = json.Unmarshal(rec.Body.Bytes(), &run)
+	if run.State != store.StateSucceeded || run.Stats.Files != 2 || run.Stats.Bytes != 8 {
+		t.Fatalf("run = %+v", run)
+	}
+
+	// A backup run shows up in the same history.
+	rec = doJSON(t, s, http.MethodPost, "/v1/targets", testToken, targetRequest{Name: "t1", Type: store.TypeSSHPath, Config: json.RawMessage(`{}`)})
+	var tgt store.Target
+	_ = json.Unmarshal(rec.Body.Bytes(), &tgt)
+	if rec := doJSON(t, s, http.MethodPost, "/v1/targets/"+tgt.ID+":run", testToken, nil); rec.Code != http.StatusCreated {
+		t.Fatalf("backup run = %d", rec.Code)
+	}
+
+	rec = doJSON(t, s, http.MethodGet, "/v1/history?since=1h", testToken, nil)
+	var hist []store.HistoryEntry
+	_ = json.Unmarshal(rec.Body.Bytes(), &hist)
+	if rec.Code != http.StatusOK || len(hist) != 2 {
+		t.Fatalf("history = %d %s", rec.Code, rec.Body.String())
+	}
+	rec = doJSON(t, s, http.MethodGet, "/v1/history?source=sync", testToken, nil)
+	_ = json.Unmarshal(rec.Body.Bytes(), &hist)
+	if len(hist) != 1 || hist[0].OwnerName != "local-mirror" || hist[0].Kind != "native" {
+		t.Fatalf("sync history = %+v", hist)
+	}
+
+	rec = doJSON(t, s, http.MethodGet, "/v1/stats?since=24h", testToken, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("stats = %d %s", rec.Code, rec.Body.String())
+	}
+	var stats StatsResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &stats)
+	if stats.BucketSeconds != 3600 || len(stats.Buckets) < 24 || stats.Totals.Runs != 2 || stats.Totals.Bytes != 8 || len(stats.Owners) != 2 {
+		t.Fatalf("stats = %+v", stats)
+	}
+	last := stats.Buckets[len(stats.Buckets)-1]
+	if last.Runs != 2 || !last.Start.Equal(time.Now().UTC().Truncate(time.Hour)) {
+		t.Fatalf("current bucket = %+v", last)
+	}
+	rec = doJSON(t, s, http.MethodGet, "/v1/stats?since=30d&owner="+job.ID, testToken, nil)
+	_ = json.Unmarshal(rec.Body.Bytes(), &stats)
+	if stats.BucketSeconds != 86400 || stats.Totals.Runs != 1 {
+		t.Fatalf("owner stats = %+v", stats)
+	}
+	for _, q := range []string{"since=bogus", "bucket=1s", "since=365d&bucket=1m"} {
+		if rec := doJSON(t, s, http.MethodGet, "/v1/stats?"+q, testToken, nil); rec.Code != http.StatusBadRequest {
+			t.Errorf("stats?%s = %d, want 400", q, rec.Code)
+		}
+	}
+
+	rec = doJSON(t, s, http.MethodGet, "/v1/sync-jobs/"+job.ID+"/runs", testToken, nil)
+	var runs []store.SyncRun
+	_ = json.Unmarshal(rec.Body.Bytes(), &runs)
+	if len(runs) != 1 {
+		t.Fatalf("runs = %s", rec.Body.String())
 	}
 }

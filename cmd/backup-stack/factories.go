@@ -2,16 +2,11 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"time"
 
-	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/knownhosts"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -20,47 +15,34 @@ import (
 	sshsrc "github.com/geekychris/backup-stack/internal/source/ssh"
 
 	s3sink "github.com/geekychris/backup-stack/internal/sink/s3"
-	syncpkg "github.com/geekychris/backup-stack/internal/sync"
-
-	"github.com/geekychris/backup-stack/internal/store"
 )
 
 // newSSHSource builds an ssh-path Source, authenticating with the private
 // key at cfg.PrivateKeyPath and verifying the host key against
 // cfg.KnownHostsPath (or skipping verification if cfg explicitly opts out —
 // never silently).
+//
+// A blank privateKeyPath / knownHostsPath falls back to BACKUP_STACK_SSH_KEY
+// / BACKUP_STACK_SSH_KNOWN_HOSTS (the mounted backup-stack-ssh Secret in
+// Kubernetes).
 func newSSHSource(cfg sshTargetConfig) (*sshsrc.Source, error) {
-	keyBytes, err := os.ReadFile(cfg.PrivateKeyPath)
-	if err != nil {
-		return nil, fmt.Errorf("ssh private key: %w", err)
+	if err := cfg.Filters.Validate(); err != nil {
+		return nil, err
 	}
-	signer, err := ssh.ParsePrivateKey(keyBytes)
-	if err != nil {
-		return nil, fmt.Errorf("ssh private key: %w", err)
+	conn := cfg.Config.WithDefaults()
+	if err := conn.Validate(); err != nil {
+		return nil, err
 	}
-	var hostKeyCB ssh.HostKeyCallback
-	switch {
-	case cfg.InsecureSkipHostKeyCheck:
-		hostKeyCB = ssh.InsecureIgnoreHostKey()
-	case cfg.KnownHostsPath != "":
-		cb, err := knownhosts.New(cfg.KnownHostsPath)
-		if err != nil {
-			return nil, fmt.Errorf("ssh known_hosts: %w", err)
-		}
-		hostKeyCB = cb
-	default:
-		return nil, errors.New("set knownHostsPath (the host's known_hosts entry) or insecureSkipHostKeyCheck")
+	cc, err := conn.ClientConfig()
+	if err != nil {
+		return nil, err
 	}
 	return sshsrc.New(sshsrc.Config{
-		Addr: cfg.Addr,
-		User: cfg.User,
-		ClientConfig: &ssh.ClientConfig{
-			User:            cfg.User,
-			Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
-			HostKeyCallback: hostKeyCB,
-			Timeout:         15 * time.Second,
-		},
-		Path: cfg.Path,
+		Addr:         conn.Addr,
+		User:         conn.User,
+		ClientConfig: cc,
+		Path:         conn.Path,
+		Filters:      cfg.Filters,
 	}), nil
 }
 
@@ -99,27 +81,6 @@ func newS3Sink(ctx context.Context, cfg s3Config) (*s3sink.Sink, error) {
 		AccessKey: cfg.AccessKey, SecretKey: cfg.SecretKey, Prefix: cfg.Prefix,
 		UseSSL: cfg.UseSSL, CreateBucket: cfg.CreateBucket,
 	})
-}
-
-// runSyncJob one-way mirrors j's source bucket onto its dest bucket.
-func runSyncJob(ctx context.Context, j *store.SyncJob) (syncpkg.Result, error) {
-	var srcCfg, dstCfg syncpkg.S3Config
-	if err := json.Unmarshal(j.SourceConfig, &srcCfg); err != nil {
-		return syncpkg.Result{}, fmt.Errorf("sourceConfig: %w", err)
-	}
-	if err := json.Unmarshal(j.DestConfig, &dstCfg); err != nil {
-		return syncpkg.Result{}, fmt.Errorf("destConfig: %w", err)
-	}
-	srcStore, err := syncpkg.NewS3Store(ctx, srcCfg)
-	if err != nil {
-		return syncpkg.Result{}, fmt.Errorf("source bucket: %w", err)
-	}
-	dstStore, err := syncpkg.NewS3Store(ctx, dstCfg)
-	if err != nil {
-		return syncpkg.Result{}, fmt.Errorf("dest bucket: %w", err)
-	}
-	syncer := &syncpkg.Syncer{Source: srcStore, Dest: dstStore}
-	return syncer.Run(ctx)
 }
 
 // writeFileAll writes r to dest, creating any missing parent directories.

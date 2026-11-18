@@ -3,22 +3,38 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+{{if .BaseHref}}<base href="{{.BaseHref}}">{{end}}
 <title>backup-stack</title>
 <style>
-  body { font: 14px/1.4 -apple-system, system-ui, sans-serif; margin: 2rem; color: #1a1a1a; }
+  :root { --ink: #1a1a1a; --muted: #666; --line: #ddd; --surface: #fcfcfb; --bar: #2a78d6; --bar-err: #d03b3b; }
+  body { font: 14px/1.4 -apple-system, system-ui, sans-serif; margin: 2rem; color: var(--ink); background: var(--surface); }
   h1 { font-size: 1.3rem; }
   h2 { font-size: 1.05rem; margin-top: 2rem; }
   table { border-collapse: collapse; width: 100%; margin-top: .5rem; }
-  th, td { text-align: left; padding: .35rem .6rem; border-bottom: 1px solid #ddd; }
+  th, td { text-align: left; padding: .35rem .6rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   .badge { display: inline-block; padding: .1rem .5rem; border-radius: .3rem; font-size: .85em; }
   .badge-succeeded { background: #d7f0d7; }
   .badge-running { background: #fff3cd; }
   .badge-failed { background: #f8d7da; }
   .badge-never { background: #eee; }
   button, input[type=submit] { cursor: pointer; }
-  .hint { color: #666; font-size: .9em; }
-  form.inline { display: inline; }
+  .hint { color: var(--muted); font-size: .9em; }
   #token-bar { margin-bottom: 1rem; }
+  form p { margin: .4rem 0; }
+  textarea { font: 12px/1.4 ui-monospace, monospace; width: 100%; max-width: 46rem; box-sizing: border-box; }
+  code { font-size: .9em; }
+  .controls { display: flex; gap: 1rem; flex-wrap: wrap; align-items: center; margin: .5rem 0; }
+  .charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 1rem; margin-top: .75rem; }
+  .chart { border: 1px solid var(--line); border-radius: 6px; padding: .5rem .6rem; background: #fff; }
+  .chart h3 { margin: 0 0 .25rem; font-size: .85rem; font-weight: 600; }
+  .chart .peak { color: var(--muted); font-weight: 400; }
+  .chart svg { display: block; width: 100%; height: 120px; }
+  .chart rect.bar:hover { opacity: .75; }
+  .totals span { margin-right: 1.25rem; }
+  .err-samples { color: #a33; font-size: .85em; white-space: pre-wrap; }
+  #error-banner { color: #b33; display: none; margin: .5rem 0; }
 </style>
 </head>
 <body>
@@ -27,8 +43,9 @@
 
 <div id="token-bar">
   <span id="token-status" class="hint"></span>
-  <button type="button" onclick="setToken()">Set admin token</button>
+  <button type="button" id="token-button" onclick="setToken()">Set admin token</button>
 </div>
+<div id="error-banner"></div>
 
 <h2>Targets</h2>
 {{template "targets-list" .Targets}}
@@ -43,7 +60,10 @@
         <option value="k8s-namespace">k8s-namespace</option>
       </select>
     </label></p>
-    <p><label>Config (JSON) <input name="config" size="60" value="{}"></label></p>
+    <p><label>Config (JSON)<br><textarea name="config" rows="3">{}</textarea></label><br>
+      <span class="hint">ssh-path: <code>{"addr":"wopr.local:22","user":"chris","path":"/etc"}</code> (key and known_hosts default to the mounted ones) ·
+      k8s-namespace: <code>{"namespaces":["default"]}</code></span></p>
+    <p><label>Filters (ssh-path; one per line, first match wins)<br><textarea name="filters" rows="3" placeholder="exclude:**/*.tmp&#10;exclude:cache/**"></textarea></label></p>
     <p><label>Sink <input name="sinkRef" placeholder="primary"></label></p>
     <p><label>Schedule (cron, blank = manual only) <input name="schedule" placeholder="@daily"></label></p>
     <p><input type="submit" value="Create target"></p>
@@ -57,43 +77,281 @@
 <h2>Sync jobs</h2>
 {{template "sync-jobs-list" .SyncJobs}}
 
+<details>
+  <summary>Add sync job</summary>
+  <form id="sync-form" onsubmit="return createSyncJob(event)">
+    <p><label>Name <input name="name" required></label></p>
+    <p><label>Source (JSON)<br><textarea name="sourceConfig" rows="2" required placeholder='{"type":"ssh","addr":"wopr.local","user":"chris","path":"/srv/photos"}'></textarea></label></p>
+    <p><label>Destination (JSON)<br><textarea name="destConfig" rows="2" required placeholder='{"type":"s3","sink":"primary","prefix":"mirror/photos"}'></textarea></label><br>
+      <span class="hint">Types: <code>{"type":"dir","path":"/data/x"}</code> (in the service's pod) ·
+      <code>{"type":"ssh","addr":"host:22","user":"u","path":"/x"}</code> ·
+      <code>{"type":"s3","sink":"primary","prefix":"p"}</code> or with endpoint/bucket/accessKey/secretKey.</span></p>
+    <p><label>Filters (one per line, first match wins)<br><textarea name="filters" rows="3" placeholder="exclude:**/node_modules/**&#10;include:*.jpg&#10;exclude:**"></textarea></label></p>
+    <p><label><input type="checkbox" name="delete"> Delete destination files the source no longer has</label>
+      <span class="hint">(off by default; excluded files are never deleted)</span></p>
+    <p><label>Schedule (cron, blank = manual only) <input name="schedule" placeholder="@hourly"></label></p>
+    <p><input type="submit" value="Create sync job"></p>
+  </form>
+</details>
+
+<h2>History and stats</h2>
+<div class="controls">
+  <label>Show
+    <select id="scope" onchange="loadStats()">
+      <option value="">Everything</option>
+      <option value="source=backup">All backups</option>
+      <option value="source=sync">All sync jobs</option>
+      {{range .Targets}}<option value="owner={{.Target.ID}}">Target: {{.Target.Name}}</option>{{end}}
+      {{range .SyncJobs}}<option value="owner={{.Job.ID}}">Sync: {{.Job.Name}}</option>{{end}}
+    </select>
+  </label>
+  <label>Period
+    <select id="period" onchange="loadStats()">
+      <option value="24h">Last 24 hours (hourly)</option>
+      <option value="7d" selected>Last 7 days (daily)</option>
+      <option value="30d">Last 30 days (daily)</option>
+      <option value="90d">Last 90 days (daily)</option>
+    </select>
+  </label>
+  <button type="button" onclick="loadStats()">Refresh</button>
+</div>
+<p class="totals hint" id="totals"></p>
+<div class="charts">
+  <div class="chart"><h3>Bytes transferred <span class="peak" id="peak-bytes"></span></h3><svg id="chart-bytes" role="img" aria-label="Bytes transferred per period"></svg></div>
+  <div class="chart"><h3>Files transferred <span class="peak" id="peak-files"></span></h3><svg id="chart-files" role="img" aria-label="Files transferred per period"></svg></div>
+  <div class="chart"><h3>Errors <span class="peak" id="peak-errors"></span></h3><svg id="chart-errors" role="img" aria-label="Errors per period"></svg></div>
+  <div class="chart"><h3>Transfer rate <span class="peak" id="peak-rate"></span></h3><svg id="chart-rate" role="img" aria-label="Average transfer rate per period"></svg></div>
+</div>
+
+<h3 style="font-size:.95rem;margin-top:1.25rem">Per target / sync job</h3>
+<table id="owners-table">
+  <thead><tr><th>What</th><th class="num">Runs</th><th class="num">Failed</th><th class="num">Files</th><th class="num">Bytes</th><th class="num">Errors</th><th class="num">Avg rate</th></tr></thead>
+  <tbody><tr><td colspan="7" class="hint">Loading…</td></tr></tbody>
+</table>
+
+<h3 style="font-size:.95rem;margin-top:1.25rem">Runs</h3>
+<table id="history-table">
+  <thead><tr><th>Started</th><th>What</th><th>Kind</th><th>State</th><th class="num">Duration</th><th class="num">Files</th><th class="num">Bytes</th><th class="num">Skipped</th><th class="num">Deleted</th><th class="num">Errors</th><th class="num">Rate</th></tr></thead>
+  <tbody><tr><td colspan="11" class="hint">Loading…</td></tr></tbody>
+</table>
+
 <script>
-function getToken() { return localStorage.getItem('backupStackToken') || ''; }
+// Every API path is relative (no leading "/"), so the page works at the
+// root of its own port and under a path prefix alike.
+var TOKEN_KEY = 'backupStackToken';
+var proxied = !!window.__cloudstackProxied; // set by cloud-stack's app proxy, which signs requests itself
+var prompted = false;
+function getToken() { try { return localStorage.getItem(TOKEN_KEY) || ''; } catch (e) { return ''; } }
+function storeToken(t) { try { localStorage.setItem(TOKEN_KEY, t); } catch (e) {} }
 function setToken() {
-  var t = prompt('Admin bearer token:', getToken());
-  if (t !== null) { localStorage.setItem('backupStackToken', t); renderTokenStatus(); }
+  var t = prompt('backup-stack admin token (BACKUP_STACK_TOKEN):', getToken());
+  if (t !== null) { storeToken(t.trim()); renderTokenStatus(); loadStats(); }
 }
 function renderTokenStatus() {
-  document.getElementById('token-status').textContent = getToken() ? 'Token set.' : 'No token set — mutations will fail.';
+  if (proxied) {
+    document.getElementById('token-status').textContent = 'Signed in through cloud-stack.';
+    document.getElementById('token-button').style.display = 'none';
+    return;
+  }
+  document.getElementById('token-status').textContent = getToken() ? 'Token set.' : 'No token set — the API will refuse requests.';
 }
-function api(path, method) {
-  return fetch(path, { method: method || 'GET', headers: { 'Authorization': 'Bearer ' + getToken(), 'Content-Type': 'application/json' } });
+function showError(msg) {
+  var b = document.getElementById('error-banner');
+  b.textContent = msg || ''; b.style.display = msg ? 'block' : 'none';
 }
-function runNow(id) {
-  api('/v1/targets/' + encodeURIComponent(id) + ':run', 'POST').then(function (r) {
-    if (!r.ok) { return r.text().then(function (t) { alert('run failed: ' + t); }); }
-    location.reload();
+function api(path, method, body) {
+  var opts = { method: method || 'GET', headers: { 'Authorization': 'Bearer ' + getToken() } };
+  if (body !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
+  return fetch(path, opts).then(function (r) {
+    if (r.status === 401 && !proxied && !prompted) {
+      prompted = true; setToken();
+      opts.headers['Authorization'] = 'Bearer ' + getToken();
+      return fetch(path, opts);
+    }
+    return r;
   });
+}
+function okOrAlert(what) {
+  return function (r) {
+    if (!r.ok) { return r.text().then(function (t) { alert(what + ' failed: ' + t); }); }
+    location.reload();
+  };
+}
+function parseFilters(text) {
+  var out = [];
+  (text || '').split('\n').forEach(function (line) {
+    line = line.trim();
+    if (!line || line[0] === '#') return;
+    var kind, pattern;
+    if (line.indexOf('+ ') === 0) { kind = 'include'; pattern = line.slice(2); }
+    else if (line.indexOf('- ') === 0) { kind = 'exclude'; pattern = line.slice(2); }
+    else { var i = line.indexOf(':'); if (i < 0) throw new Error('filter "' + line + '": want include:pattern or exclude:pattern'); kind = line.slice(0, i).trim(); pattern = line.slice(i + 1); }
+    out.push({ kind: kind, pattern: pattern.trim() });
+  });
+  return out;
+}
+function runNow(id) { api('v1/targets/' + encodeURIComponent(id) + ':run', 'POST').then(okOrAlert('run')); }
+function runSync(id) { api('v1/sync-jobs/' + encodeURIComponent(id) + ':run', 'POST').then(okOrAlert('sync')); }
+function showHistory(id) {
+  var sel = document.getElementById('scope');
+  sel.value = 'owner=' + id; loadStats();
+  document.getElementById('scope').scrollIntoView({ behavior: 'smooth' });
 }
 function createTarget(ev) {
   ev.preventDefault();
-  var f = ev.target;
-  var config;
+  var f = ev.target, config, filters;
   try { config = JSON.parse(f.config.value || '{}'); } catch (e) { alert('config is not valid JSON'); return false; }
-  var body = { name: f.name.value, type: f.type.value, config: config, sinkRef: f.sinkRef.value, schedule: f.schedule.value };
-  fetch('/v1/targets', { method: 'POST', headers: { 'Authorization': 'Bearer ' + getToken(), 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
-    .then(function (r) {
-      if (!r.ok) { return r.text().then(function (t) { alert('create failed: ' + t); }); }
-      location.reload();
-    });
+  try { filters = parseFilters(f.filters.value); } catch (e) { alert(e.message); return false; }
+  if (filters.length) config.filters = filters;
+  api('v1/targets', 'POST', { name: f.name.value, type: f.type.value, config: config, sinkRef: f.sinkRef.value, schedule: f.schedule.value })
+    .then(okOrAlert('create'));
+  return false;
+}
+function createSyncJob(ev) {
+  ev.preventDefault();
+  var f = ev.target, src, dst, filters;
+  try { src = JSON.parse(f.sourceConfig.value); dst = JSON.parse(f.destConfig.value); } catch (e) { alert('source/destination must be valid JSON'); return false; }
+  try { filters = parseFilters(f.filters.value); } catch (e) { alert(e.message); return false; }
+  api('v1/sync-jobs', 'POST', { name: f.name.value, sourceConfig: src, destConfig: dst, filters: filters, delete: f['delete'].checked, schedule: f.schedule.value })
+    .then(okOrAlert('create'));
   return false;
 }
 function discover() {
-  api('/v1/discover').then(function (r) { return r.json(); }).then(function (list) {
+  api('v1/discover').then(function (r) { return r.json(); }).then(function (list) {
     document.getElementById('discover-out').textContent = JSON.stringify(list, null, 2);
   });
 }
+
+// ---- formatting ----
+function fmtBytes(n) {
+  if (!n) return '0 B';
+  var u = ['B', 'KB', 'MB', 'GB', 'TB'], i = 0;
+  while (n >= 1000 && i < u.length - 1) { n /= 1000; i++; }
+  return (n >= 100 || i === 0 ? Math.round(n) : n.toFixed(1)) + ' ' + u[i];
+}
+function fmtRate(bps) { return bps ? fmtBytes(bps) + '/s' : '—'; }
+function fmtNum(n) { return (n || 0).toLocaleString(); }
+function fmtDur(ms) {
+  if (!ms) return '—';
+  var s = ms / 1000;
+  if (s < 60) return s.toFixed(s < 10 ? 1 : 0) + ' s';
+  if (s < 3600) return Math.floor(s / 60) + 'm ' + Math.round(s % 60) + 's';
+  return Math.floor(s / 3600) + 'h ' + Math.round((s % 3600) / 60) + 'm';
+}
+function fmtTime(iso, daily) {
+  var d = new Date(iso);
+  return daily ? d.toLocaleDateString([], { month: 'short', day: 'numeric' })
+               : d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+function el(tag, attrs, text) {
+  var e = document.createElement(tag);
+  for (var k in attrs || {}) e.setAttribute(k, attrs[k]);
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+// ---- charts: one series each, inline SVG bars on a zero baseline ----
+var SVGNS = 'http://www.w3.org/2000/svg';
+function svgEl(tag, attrs) {
+  var e = document.createElementNS(SVGNS, tag);
+  for (var k in attrs) e.setAttribute(k, attrs[k]);
+  return e;
+}
+function drawBars(id, buckets, value, fmt, color, daily) {
+  var svg = document.getElementById(id);
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+  var W = 300, H = 120, top = 6, bottom = 18, plotH = H - top - bottom;
+  svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+  svg.setAttribute('preserveAspectRatio', 'none');
+  var max = 0;
+  buckets.forEach(function (b) { max = Math.max(max, value(b)); });
+  document.getElementById('peak-' + id.slice(6)).textContent = max ? '(peak ' + fmt(max) + ')' : '';
+  svg.appendChild(svgEl('line', { x1: 0, x2: W, y1: top + plotH, y2: top + plotH, stroke: '#ccc', 'stroke-width': 1 }));
+  if (!buckets.length) return;
+  var slot = W / buckets.length, gap = Math.min(2, slot * 0.3), barW = Math.max(1, slot - gap);
+  buckets.forEach(function (b, i) {
+    var v = value(b), h = max ? (v / max) * plotH : 0;
+    var x = i * slot + gap / 2;
+    // Hit target spans the whole slot so thin bars are still hoverable.
+    var g = svgEl('g', {});
+    var title = svgEl('title', {});
+    title.textContent = fmtTime(b.start, daily) + ': ' + fmt(v) + ' (' + b.runs + ' run' + (b.runs === 1 ? '' : 's') + ')';
+    g.appendChild(title);
+    g.appendChild(svgEl('rect', { x: i * slot, y: top, width: slot, height: plotH, fill: 'transparent' }));
+    if (h > 0) g.appendChild(svgEl('rect', { 'class': 'bar', x: x, y: top + plotH - h, width: barW, height: h, style: 'fill:' + color, rx: Math.min(2, barW / 2) }));
+    svg.appendChild(g);
+  });
+  var first = svgEl('text', { x: 0, y: H - 4, 'font-size': 10, fill: '#666' });
+  first.textContent = fmtTime(buckets[0].start, daily);
+  var last = svgEl('text', { x: W, y: H - 4, 'font-size': 10, fill: '#666', 'text-anchor': 'end' });
+  last.textContent = fmtTime(buckets[buckets.length - 1].start, daily);
+  svg.appendChild(first); svg.appendChild(last);
+}
+
+function fillOwners(owners) {
+  var tb = document.querySelector('#owners-table tbody');
+  tb.innerHTML = '';
+  if (!owners.length) { tb.appendChild(el('tr')).appendChild(el('td', { colspan: 7, 'class': 'hint' }, 'No runs in this period.')); return; }
+  owners.forEach(function (o) {
+    var tr = el('tr');
+    tr.appendChild(el('td', {}, (o.source === 'sync' ? 'Sync: ' : 'Target: ') + o.ownerName));
+    [fmtNum(o.runs), fmtNum(o.failed), fmtNum(o.files), fmtBytes(o.bytes), fmtNum(o.errors), fmtRate(o.rateBps)].forEach(function (v) {
+      tr.appendChild(el('td', { 'class': 'num' }, v));
+    });
+    tb.appendChild(tr);
+  });
+}
+
+function fillHistory(list) {
+  var tb = document.querySelector('#history-table tbody');
+  tb.innerHTML = '';
+  if (!list.length) { tb.appendChild(el('tr')).appendChild(el('td', { colspan: 11, 'class': 'hint' }, 'No runs in this period.')); return; }
+  list.forEach(function (e) {
+    var tr = el('tr'), st = e.stats || {};
+    tr.appendChild(el('td', {}, fmtTime(e.startedAt, false)));
+    tr.appendChild(el('td', {}, (e.source === 'sync' ? 'Sync: ' : 'Target: ') + e.ownerName));
+    tr.appendChild(el('td', {}, e.kind));
+    var stateTd = el('td');
+    stateTd.appendChild(el('span', { 'class': 'badge badge-' + e.state }, e.state));
+    if (e.error) stateTd.appendChild(el('div', { 'class': 'err-samples' }, e.error));
+    if (st.errorSamples && st.errorSamples.length > 1) {
+      var d = el('details'); d.appendChild(el('summary', { 'class': 'hint' }, st.errorSamples.length + ' sample errors'));
+      d.appendChild(el('div', { 'class': 'err-samples' }, st.errorSamples.join('\n')));
+      stateTd.appendChild(d);
+    }
+    tr.appendChild(stateTd);
+    [fmtDur(e.durationMs), fmtNum(st.files), fmtBytes(st.bytes), fmtNum(st.skipped), fmtNum(st.deleted), fmtNum(st.errors), fmtRate(e.rateBps)].forEach(function (v) {
+      tr.appendChild(el('td', { 'class': 'num' }, v));
+    });
+    tb.appendChild(tr);
+  });
+}
+
+function loadStats() {
+  var scope = document.getElementById('scope').value, since = document.getElementById('period').value;
+  var q = 'since=' + encodeURIComponent(since) + (scope ? '&' + scope : '');
+  showError('');
+  api('v1/stats?' + q).then(function (r) {
+    if (!r.ok) return r.text().then(function (t) { throw new Error('stats: ' + r.status + ' ' + t); });
+    return r.json();
+  }).then(function (s) {
+    var daily = s.bucketSeconds >= 86400, t = s.totals;
+    document.getElementById('totals').innerHTML = '';
+    [['Runs', fmtNum(t.runs)], ['Failed', fmtNum(t.failed)], ['Files', fmtNum(t.files)], ['Bytes', fmtBytes(t.bytes)],
+     ['Errors', fmtNum(t.errors)], ['Avg rate', fmtRate(t.rateBps)], ['Busy time', fmtDur(t.durationMs)]].forEach(function (p) {
+      document.getElementById('totals').appendChild(el('span', {}, p[0] + ': ' + p[1]));
+    });
+    drawBars('chart-bytes', s.buckets, function (b) { return b.bytes; }, fmtBytes, 'var(--bar)', daily);
+    drawBars('chart-files', s.buckets, function (b) { return b.files; }, fmtNum, 'var(--bar)', daily);
+    drawBars('chart-errors', s.buckets, function (b) { return b.errors; }, fmtNum, 'var(--bar-err)', daily);
+    drawBars('chart-rate', s.buckets, function (b) { return b.rateBps; }, fmtRate, 'var(--bar)', daily);
+    fillOwners(s.owners || []);
+  }).catch(function (e) { showError(e.message); });
+  api('v1/history?limit=200&' + q).then(function (r) { return r.ok ? r.json() : []; }).then(fillHistory);
+}
+
 renderTokenStatus();
+if (!proxied && !getToken()) { prompted = true; setToken(); } else { loadStats(); }
 </script>
 </body>
 </html>
@@ -109,7 +367,8 @@ renderTokenStatus();
   <td>{{.Target.Type}}</td>
   <td>{{if .Target.Schedule}}{{.Target.Schedule}}{{else}}manual{{end}}</td>
   <td><span class="badge badge-{{if .LastRun}}{{.LastRun.State}}{{else}}never{{end}}">{{statusBadge .}}</span></td>
-  <td><button type="button" onclick="runNow('{{.Target.ID}}')">Run now</button></td>
+  <td><button type="button" onclick="runNow('{{.Target.ID}}')">Run now</button>
+      <button type="button" onclick="showHistory('{{.Target.ID}}')">History</button></td>
 </tr>
 {{else}}
 <tr><td colspan="5" class="hint">No targets yet.</td></tr>
@@ -120,16 +379,23 @@ renderTokenStatus();
 
 {{define "sync-jobs-list"}}
 <table>
-<thead><tr><th>Name</th><th>Schedule</th><th>Last run</th></tr></thead>
+<thead><tr><th>Name</th><th>Kind</th><th>From → to</th><th>Filters</th><th>Delete</th><th>Schedule</th><th>Last run</th><th></th></tr></thead>
 <tbody>
 {{range .}}
 <tr>
   <td>{{.Job.Name}}</td>
+  <td>{{.Kind}}</td>
+  <td>{{.From}} → {{.To}}</td>
+  <td>{{len .Job.Filters}}</td>
+  <td>{{if .Job.Delete}}yes{{else}}no{{end}}</td>
   <td>{{if .Job.Schedule}}{{.Job.Schedule}}{{else}}manual{{end}}</td>
-  <td>{{if .Job.LastRunState}}{{.Job.LastRunState}}{{else}}never run{{end}}</td>
+  <td><span class="badge badge-{{if .Job.LastRunState}}{{.Job.LastRunState}}{{else}}never{{end}}">{{if .Job.LastRunState}}{{.Job.LastRunState}}{{else}}never run{{end}}</span>
+      {{if .Job.LastRunError}}<div class="err-samples">{{.Job.LastRunError}}</div>{{end}}</td>
+  <td><button type="button" onclick="runSync('{{.Job.ID}}')">Run now</button>
+      <button type="button" onclick="showHistory('{{.Job.ID}}')">History</button></td>
 </tr>
 {{else}}
-<tr><td colspan="3" class="hint">No sync jobs yet.</td></tr>
+<tr><td colspan="8" class="hint">No sync jobs yet.</td></tr>
 {{end}}
 </tbody>
 </table>

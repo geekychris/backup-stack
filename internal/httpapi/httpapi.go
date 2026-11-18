@@ -1,6 +1,6 @@
 // Package httpapi is backup-stack's JSON API: target and sync-job CRUD,
-// triggering a run, and reading run history. Every route requires a bearer
-// token.
+// triggering a run, run history, and stats aggregated over time. Every
+// /v1 route requires the bearer token; GET /healthz doesn't.
 package httpapi
 
 import (
@@ -10,17 +10,30 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/geekychris/backup-stack/internal/backup"
 	"github.com/geekychris/backup-stack/internal/cloudstackinfra"
+	"github.com/geekychris/backup-stack/internal/filter"
+	"github.com/geekychris/backup-stack/internal/runstats"
 	"github.com/geekychris/backup-stack/internal/sink"
 	"github.com/geekychris/backup-stack/internal/source"
 	"github.com/geekychris/backup-stack/internal/store"
+	syncpkg "github.com/geekychris/backup-stack/internal/sync"
 )
+
+// SyncRunner runs a sync job once, recording the run (internal/sync.Runner).
+type SyncRunner interface {
+	Run(ctx context.Context, j *store.SyncJob) (*store.SyncRun, error)
+}
 
 // Deps are a Server's dependencies. BuildSource and ResolveSink are
 // injected so the API layer never hard-codes how a Target's Type/Config
@@ -33,6 +46,8 @@ type Deps struct {
 	BuildSource func(ctx context.Context, t *store.Target) (source.Source, error)
 	// ResolveSink returns the Sink a target's SinkRef names.
 	ResolveSink func(t *store.Target) (sink.Sink, error)
+	// Sync runs sync jobs; nil disables POST /v1/sync-jobs/{id}:run.
+	Sync SyncRunner
 	// Infra discovers backup-target candidates from cloud-stack's infra
 	// registry; nil disables GET /v1/discover.
 	Infra *cloudstackinfra.Client
@@ -68,6 +83,11 @@ func New(d Deps) *Server {
 			r.Get("/sync-jobs/{id}", s.getSyncJob)
 			r.Put("/sync-jobs/{id}", s.updateSyncJob)
 			r.Delete("/sync-jobs/{id}", s.deleteSyncJob)
+			r.Post("/sync-jobs/{id}:run", s.runSyncJob)
+			r.Get("/sync-jobs/{id}/runs", s.listSyncRuns)
+
+			r.Get("/history", s.history)
+			r.Get("/stats", s.stats)
 
 			r.Get("/discover", s.discover)
 		})
@@ -79,7 +99,15 @@ func New(d Deps) *Server {
 // ServeHTTP implements http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
 
-func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
+// healthz is 200 while the store answers, 503 otherwise. No auth: it's the
+// Kubernetes probe and cloud-stack's health check.
+func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	if err := s.d.Store.Ping(ctx); err != nil {
+		http.Error(w, "store: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok"))
 }
@@ -151,6 +179,10 @@ func (s *Server) createTarget(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "name and type are required")
 		return
 	}
+	if err := validateTargetConfig(req.Type, req.Config); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	enabled := true
 	if req.Enabled != nil {
 		enabled = *req.Enabled
@@ -198,6 +230,10 @@ func (s *Server) updateTarget(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Config != nil {
 		existing.Config = req.Config
+	}
+	if err := validateTargetConfig(existing.Type, existing.Config); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 	existing.SinkRef = req.SinkRef
 	existing.Schedule = req.Schedule
@@ -277,14 +313,48 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, runs)
 }
 
+// validateTargetConfig checks the parts of a target's config the API can
+// check without connecting: an ssh-path target's filter rules.
+func validateTargetConfig(typ string, cfg json.RawMessage) error {
+	if typ != store.TypeSSHPath || len(cfg) == 0 {
+		return nil
+	}
+	var c struct {
+		Filters filter.Rules `json:"filters"`
+	}
+	if err := json.Unmarshal(cfg, &c); err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
+	return c.Filters.Validate()
+}
+
 // ---- sync jobs ----
 
 type syncJobRequest struct {
 	Name         string          `json:"name"`
 	SourceConfig json.RawMessage `json:"sourceConfig"`
 	DestConfig   json.RawMessage `json:"destConfig"`
+	Filters      *filter.Rules   `json:"filters"`
+	Delete       *bool           `json:"delete"`
 	Schedule     string          `json:"schedule"`
 	Enabled      *bool           `json:"enabled"`
+}
+
+// syncJobView is a sync job with its derived kind ("dir->s3", ...).
+type syncJobView struct {
+	*store.SyncJob
+	Kind string `json:"kind"`
+}
+
+func viewSyncJob(j *store.SyncJob) syncJobView {
+	return syncJobView{SyncJob: j, Kind: syncpkg.JobKind(j.SourceConfig, j.DestConfig)}
+}
+
+func validateSyncJob(j *store.SyncJob) error {
+	if err := syncpkg.ValidateJob(j.SourceConfig, j.DestConfig); err != nil {
+		return err
+	}
+	return j.Filters.Validate()
 }
 
 func (s *Server) listSyncJobs(w http.ResponseWriter, r *http.Request) {
@@ -293,7 +363,11 @@ func (s *Server) listSyncJobs(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, list)
+	out := make([]syncJobView, 0, len(list))
+	for _, j := range list {
+		out = append(out, viewSyncJob(j))
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) createSyncJob(w http.ResponseWriter, r *http.Request) {
@@ -314,11 +388,21 @@ func (s *Server) createSyncJob(w http.ResponseWriter, r *http.Request) {
 		ID: randomID("sync"), Name: req.Name, SourceConfig: req.SourceConfig, DestConfig: req.DestConfig,
 		Schedule: req.Schedule, Enabled: enabled,
 	}
+	if req.Filters != nil {
+		j.Filters = *req.Filters
+	}
+	if req.Delete != nil {
+		j.Delete = *req.Delete
+	}
+	if err := validateSyncJob(j); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if err := s.d.Store.CreateSyncJob(r.Context(), j); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusCreated, j)
+	writeJSON(w, http.StatusCreated, viewSyncJob(j))
 }
 
 func (s *Server) getSyncJob(w http.ResponseWriter, r *http.Request) {
@@ -327,7 +411,7 @@ func (s *Server) getSyncJob(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, j)
+	writeJSON(w, http.StatusOK, viewSyncJob(j))
 }
 
 func (s *Server) updateSyncJob(w http.ResponseWriter, r *http.Request) {
@@ -351,15 +435,25 @@ func (s *Server) updateSyncJob(w http.ResponseWriter, r *http.Request) {
 	if req.DestConfig != nil {
 		existing.DestConfig = req.DestConfig
 	}
+	if req.Filters != nil {
+		existing.Filters = *req.Filters
+	}
+	if req.Delete != nil {
+		existing.Delete = *req.Delete
+	}
 	existing.Schedule = req.Schedule
 	if req.Enabled != nil {
 		existing.Enabled = *req.Enabled
+	}
+	if err := validateSyncJob(existing); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 	if err := s.d.Store.UpdateSyncJob(r.Context(), existing); err != nil {
 		writeStoreErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, existing)
+	writeJSON(w, http.StatusOK, viewSyncJob(existing))
 }
 
 func (s *Server) deleteSyncJob(w http.ResponseWriter, r *http.Request) {
@@ -368,6 +462,192 @@ func (s *Server) deleteSyncJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// runSyncJob runs a sync job now, synchronously (like runTarget); 409 if a
+// run of it is already in progress.
+func (s *Server) runSyncJob(w http.ResponseWriter, r *http.Request) {
+	if s.d.Sync == nil {
+		writeError(w, http.StatusNotImplemented, "sync runner not configured")
+		return
+	}
+	j, err := s.d.Store.GetSyncJob(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	run, err := s.d.Sync.Run(r.Context(), j)
+	if err != nil {
+		if errors.Is(err, store.ErrSyncInFlight) {
+			writeError(w, http.StatusConflict, "sync job already has a run in progress")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, run)
+}
+
+func (s *Server) listSyncRuns(w http.ResponseWriter, r *http.Request) {
+	runs, err := s.d.Store.ListSyncRuns(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, runs)
+}
+
+// ---- history and stats ----
+
+// parseWindow reads ?since= (a duration back from now: "24h", "7d", "30d";
+// or an RFC 3339 time; default 7d) and ?until= (RFC 3339; default now).
+func parseWindow(r *http.Request, now time.Time) (time.Time, time.Time, error) {
+	until := now
+	if v := r.URL.Query().Get("until"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("until: %w", err)
+		}
+		until = t
+	}
+	v := r.URL.Query().Get("since")
+	if v == "" {
+		v = "7d"
+	}
+	if t, err := time.Parse(time.RFC3339, v); err == nil {
+		return t, until, nil
+	}
+	d, err := parseDuration(v)
+	if err != nil || d <= 0 {
+		return time.Time{}, time.Time{}, fmt.Errorf("since: want a duration like 24h or 7d, or an RFC 3339 time, got %q", v)
+	}
+	return until.Add(-d), until, nil
+}
+
+// parseDuration is time.ParseDuration plus a "d" (day) unit.
+func parseDuration(v string) (time.Duration, error) {
+	if n, ok := strings.CutSuffix(v, "d"); ok {
+		days, err := strconv.ParseFloat(n, 64)
+		if err != nil {
+			return 0, err
+		}
+		return time.Duration(days * float64(24*time.Hour)), nil
+	}
+	return time.ParseDuration(v)
+}
+
+func historyQuery(r *http.Request, since, until time.Time) store.HistoryQuery {
+	q := r.URL.Query()
+	return store.HistoryQuery{Source: q.Get("source"), OwnerID: q.Get("owner"), Since: since, Until: until}
+}
+
+// history lists backup and sync runs, most recent first. Query: source
+// (backup|sync), owner (a target or sync job id), since, until, limit
+// (default 200).
+func (s *Server) history(w http.ResponseWriter, r *http.Request) {
+	since, until, err := parseWindow(r, time.Now().UTC())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	q := historyQuery(r, since, until)
+	q.Limit = 200
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			writeError(w, http.StatusBadRequest, "limit must be a positive integer")
+			return
+		}
+		q.Limit = n
+	}
+	list, err := s.d.Store.ListHistory(r.Context(), q)
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	if list == nil {
+		list = []*store.HistoryEntry{}
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+// OwnerTotals is one target's or sync job's totals over a stats window.
+type OwnerTotals struct {
+	Source    string `json:"source"`
+	OwnerID   string `json:"ownerId"`
+	OwnerName string `json:"ownerName"`
+	runstats.Totals
+}
+
+// StatsResponse is GET /v1/stats.
+type StatsResponse struct {
+	Since         time.Time         `json:"since"`
+	Until         time.Time         `json:"until"`
+	BucketSeconds int64             `json:"bucketSeconds"`
+	Buckets       []runstats.Bucket `json:"buckets"`
+	Totals        runstats.Totals   `json:"totals"`
+	Owners        []OwnerTotals     `json:"owners"`
+}
+
+// stats aggregates runs into time buckets for the graphs, plus totals
+// overall and per target / sync job. Query: source, owner, since, until,
+// bucket (a duration; default 1h for windows up to 2 days, else 1d).
+func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
+	since, until, err := parseWindow(r, time.Now().UTC())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	width := time.Hour
+	if until.Sub(since) > 48*time.Hour {
+		width = 24 * time.Hour
+	}
+	if v := r.URL.Query().Get("bucket"); v != "" {
+		d, err := parseDuration(v)
+		if err != nil || d < time.Minute {
+			writeError(w, http.StatusBadRequest, "bucket must be a duration of at least 1m")
+			return
+		}
+		width = d
+	}
+	if until.Sub(since)/width > 2000 {
+		writeError(w, http.StatusBadRequest, "too many buckets: widen bucket or narrow since")
+		return
+	}
+	list, err := s.d.Store.ListHistory(r.Context(), historyQuery(r, since, until))
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	points := make([]runstats.Point, 0, len(list))
+	byOwner := map[string]*OwnerTotals{}
+	ownerPoints := map[string][]runstats.Point{}
+	for _, e := range list {
+		p := e.Point()
+		points = append(points, p)
+		k := e.Source + "/" + e.OwnerID
+		if _, ok := byOwner[k]; !ok {
+			byOwner[k] = &OwnerTotals{Source: e.Source, OwnerID: e.OwnerID, OwnerName: e.OwnerName}
+		}
+		ownerPoints[k] = append(ownerPoints[k], p)
+	}
+	resp := StatsResponse{
+		Since: since, Until: until, BucketSeconds: int64(width / time.Second),
+		Buckets: runstats.Aggregate(points, width, since, until),
+		Totals:  runstats.Total(points),
+		Owners:  []OwnerTotals{},
+	}
+	for k, o := range byOwner {
+		o.Totals = runstats.Total(ownerPoints[k])
+		resp.Owners = append(resp.Owners, *o)
+	}
+	sort.Slice(resp.Owners, func(i, j int) bool {
+		if resp.Owners[i].Source != resp.Owners[j].Source {
+			return resp.Owners[i].Source < resp.Owners[j].Source
+		}
+		return resp.Owners[i].OwnerName < resp.Owners[j].OwnerName
+	})
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // ---- discovery ----
