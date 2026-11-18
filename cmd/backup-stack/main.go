@@ -30,8 +30,11 @@ import (
 	"syscall"
 	"time"
 
+	"k8s.io/client-go/kubernetes"
+
 	"github.com/geekychris/backup-stack/internal/backup"
 	"github.com/geekychris/backup-stack/internal/cloudstackinfra"
+	"github.com/geekychris/backup-stack/internal/clusters"
 	"github.com/geekychris/backup-stack/internal/filter"
 	"github.com/geekychris/backup-stack/internal/httpapi"
 	"github.com/geekychris/backup-stack/internal/scheduler"
@@ -154,6 +157,28 @@ func newSyncRunner(st *store.Store, sinks map[string]s3Config) *syncpkg.Runner {
 	}
 }
 
+// clusterRegistry is the clusters a k8s target can name: this one
+// (BACKUP_STACK_CLUSTER_NAME, when running in Kubernetes) and a kubeconfig
+// file per other cluster in BACKUP_STACK_KUBE_DIR (default
+// /etc/backup-stack/kube, the mounted backup-stack-kubeconfigs Secret).
+func clusterRegistry() *clusters.Registry {
+	dir := os.Getenv("BACKUP_STACK_KUBE_DIR")
+	if dir == "" {
+		dir = "/etc/backup-stack/kube"
+	}
+	_, err := os.Stat("/var/run/secrets/kubernetes.io/serviceaccount/token")
+	return &clusters.Registry{LocalName: os.Getenv("BACKUP_STACK_CLUSTER_NAME"), KubeDir: dir, InCluster: err == nil}
+}
+
+// sinkInfos describes the sinks for the UI, without credentials.
+func sinkInfos(sinks map[string]s3Config) []httpapi.SinkInfo {
+	out := make([]httpapi.SinkInfo, 0, len(sinks))
+	for name, c := range sinks {
+		out = append(out, httpapi.SinkInfo{Name: name, Endpoint: c.Endpoint, Bucket: c.Bucket, Prefix: c.Prefix})
+	}
+	return out
+}
+
 func cloudStackClient() *cloudstackinfra.Client {
 	return cloudstackinfra.New(os.Getenv("CLOUDSTACK_URL"), os.Getenv("CLOUDSTACK_TOKEN"))
 }
@@ -246,7 +271,16 @@ func cmdServe(ctx context.Context, args []string) error {
 		ResolveSink: func(t *store.Target) (sink.Sink, error) { return resolveSink(t, sinks) },
 		Sync:        syncRunner,
 		Infra:       cs,
-		Token:       token,
+		Clusters:    clusterRegistry(),
+		KubeClient: func(path string) (kubernetes.Interface, error) {
+			rc, err := newRestConfig(path)
+			if err != nil {
+				return nil, err
+			}
+			return kubernetes.NewForConfig(rc)
+		},
+		Sinks: sinkInfos(sinks),
+		Token: token,
 	})
 	webHandler := &webui.Handler{Store: st, CloudStackConfigured: os.Getenv("CLOUDSTACK_URL") != ""}
 

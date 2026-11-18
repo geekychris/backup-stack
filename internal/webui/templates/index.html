@@ -35,6 +35,43 @@
   .totals span { margin-right: 1.25rem; }
   .err-samples { color: #a33; font-size: .85em; white-space: pre-wrap; }
   #error-banner { color: #b33; display: none; margin: .5rem 0; }
+  button.primary { background: #2a78d6; color: #fff; border: 1px solid #2a78d6; border-radius: 4px; padding: .3rem .7rem; }
+  button.danger { color: #b33; }
+  .table-wrap { overflow-x: auto; }
+  h3.group { font-size: .95rem; margin: 1.25rem 0 .25rem; }
+  table.targets td.actions { white-space: nowrap; }
+  table.targets td.actions button { margin: 0 .15rem .2rem 0; }
+  table.targets tr.disabled td { opacity: .55; }
+  .copies { max-width: 34rem; }
+  .what { display: inline-block; font-size: .8em; font-weight: 600; padding: .05rem .5rem; border-radius: 999px; white-space: nowrap; }
+  .what-k8s { background: #dbeafe; color: #1e3a8a; }
+  .what-ssh { background: #dcfce7; color: #14532d; }
+  .what-soon { background: #f1f5f9; color: #475569; border: 1px dashed #94a3b8; }
+  details.explain { margin: .5rem 0; } details.explain table.kinds td { vertical-align: top; }
+  dialog { border: 1px solid var(--line); border-radius: 8px; padding: 0; width: min(46rem, calc(100vw - 2rem)); max-height: calc(100vh - 2rem); }
+  dialog::backdrop { background: rgba(0,0,0,.35); }
+  .dlg { padding: 1rem 1.25rem; }
+  .dlg h3 { margin: 0 0 .5rem; }
+  .dlg fieldset { border: 1px solid var(--line); border-radius: 6px; margin: .75rem 0; padding: .5rem .8rem; }
+  .dlg legend { font-weight: 600; padding: 0 .3rem; }
+  .field { margin: .55rem 0; }
+  .field > label, .field .label { display: block; font-weight: 600; margin-bottom: .15rem; }
+  .field input:not([type=checkbox]), .field select, .field textarea { width: 100%; max-width: 100%; box-sizing: border-box; padding: .3rem; }
+  .field .opt { font-weight: 400; color: var(--muted); font-size: .85em; }
+  .help { color: var(--muted); font-size: .85em; margin-top: .2rem; }
+  .help.warn, p.warn, .warn { color: #a35a00; }
+  .row2 { display: grid; grid-template-columns: 7rem 1fr; gap: .75rem; }
+  .sched { display: flex; gap: .4rem; flex-wrap: wrap; }
+  .sched select, .sched input { width: auto !important; }
+  .kinds-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr)); gap: .15rem .75rem; font-size: .9em; }
+  .ns-info { background: #f6f8fa; border-radius: 6px; padding: .1rem .7rem; font-size: .9em; }
+  .ns-info:empty { display: none; }
+  .ns-info ul { margin: .2rem 0 .4rem; padding-left: 1.2rem; }
+  .buttons { text-align: right; margin-top: .75rem; }
+  details.cov { border-bottom: 1px solid var(--line); padding: .35rem 0; }
+  details.cov .badge { margin-left: .35rem; }
+  details.advanced summary { cursor: pointer; color: var(--muted); }
+  @media (max-width: 600px) { body { margin: 1rem; } .row2 { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
@@ -47,52 +84,202 @@
 </div>
 <div id="error-banner"></div>
 
-<h2>Targets</h2>
-{{template "targets-list" .Targets}}
-
-<details>
-  <summary>Add target</summary>
-  <form id="target-form" onsubmit="return createTarget(event)">
-    <p><label>Name <input name="name" required></label></p>
-    <p><label>Type
-      <select name="type">
-        <option value="ssh-path">ssh-path</option>
-        <option value="k8s-namespace">k8s-namespace</option>
-      </select>
-    </label></p>
-    <p><label>Config (JSON)<br><textarea name="config" rows="3">{}</textarea></label><br>
-      <span class="hint">ssh-path: <code>{"addr":"wopr.local:22","user":"chris","path":"/etc"}</code> (key and known_hosts default to the mounted ones) ·
-      k8s-namespace: <code>{"namespaces":["default"]}</code></span></p>
-    <p><label>Filters (ssh-path; one per line, first match wins)<br><textarea name="filters" rows="3" placeholder="exclude:**/*.tmp&#10;exclude:cache/**"></textarea></label></p>
-    <p><label>Sink <input name="sinkRef" placeholder="primary"></label></p>
-    <p><label>Schedule (cron, blank = manual only) <input name="schedule" placeholder="@daily"></label></p>
-    <p><input type="submit" value="Create target"></p>
-  </form>
+<h2>Backups</h2>
+<p class="hint">A backup copies one thing, on a schedule, into a destination bucket, as a chain of full and incremental runs you can restore from.
+  Each row says <strong>what it copies</strong>. One backup per namespace (or per directory) keeps them small, easy to schedule and easy to restore.</p>
+<details class="explain">
+  <summary>What can be backed up</summary>
+  <table class="kinds">
+    <tr><td><span class="what what-k8s">Kubernetes objects</span></td><td>The manifests of one namespace: ConfigMaps, Secrets, Services, Deployments, StatefulSets, PVCs (the claims), Ingresses, … — enough to recreate the namespace with <code>kubectl apply</code>. <strong>Not</strong> the files on its volumes or what its databases hold.</td></tr>
+    <tr><td><span class="what what-ssh">Files over SSH</span></td><td>Every file under a directory on a host (wopr's <code>/etc</code>, a photo folder, …), read over SSH with the key in the <code>backup-stack-ssh</code> Secret. Filter rules choose which files.</td></tr>
+    <tr><td><span class="what what-soon">Volume files</span></td><td>The files on a PersistentVolume. <em>Coming next.</em> Until then the namespace view shows each volume as <em>not backed up</em>.</td></tr>
+    <tr><td><span class="what what-soon">Database dump</span></td><td>A consistent dump (<code>pg_dump</code>, <code>mysqldump</code>, <code>mongodump</code>) taken inside the database's own pod. <em>Coming next.</em> Copying a live database's files is not a safe backup; a dump is.</td></tr>
+  </table>
 </details>
-
-<p><button type="button" onclick="discover()">Discover from cloud-stack</button>
-  <span class="hint">{{if not .CloudStack}}(not configured){{end}}</span></p>
-<pre id="discover-out"></pre>
+<div class="controls">
+  <button type="button" class="primary" onclick="openTargetEditor('k8s-namespace')">＋ Back up a namespace</button>
+  <button type="button" onclick="openTargetEditor('ssh-path')">＋ Back up files over SSH</button>
+  <button type="button" onclick="openCoverage()">What isn't backed up?</button>
+</div>
+<div id="targets-rich"></div>
+<noscript>{{template "targets-list" .Targets}}</noscript>
+<div id="targets-fallback" hidden>{{template "targets-list" .Targets}}</div>
 
 <h2>Sync jobs</h2>
-{{template "sync-jobs-list" .SyncJobs}}
+<p class="hint">A sync job keeps a copy of a directory or bucket somewhere else: one-way, newest wins, no history. Use a backup when you need to go back in time; a sync job when you want a mirror (photos to the NAS, a bucket offsite).</p>
+<div class="controls">
+  <button type="button" onclick="openSyncEditor()">＋ Add sync job</button>
+</div>
+<div id="sync-rich"></div>
+<div id="sync-fallback" hidden>{{template "sync-jobs-list" .SyncJobs}}</div>
 
-<details>
-  <summary>Add sync job</summary>
-  <form id="sync-form" onsubmit="return createSyncJob(event)">
-    <p><label>Name <input name="name" required></label></p>
-    <p><label>Source (JSON)<br><textarea name="sourceConfig" rows="2" required placeholder='{"type":"ssh","addr":"wopr.local","user":"chris","path":"/srv/photos"}'></textarea></label></p>
-    <p><label>Destination (JSON)<br><textarea name="destConfig" rows="2" required placeholder='{"type":"s3","sink":"primary","prefix":"mirror/photos"}'></textarea></label><br>
-      <span class="hint">Types: <code>{"type":"dir","path":"/data/x"}</code> (in the service's pod) ·
-      <code>{"type":"ssh","addr":"host:22","user":"u","path":"/x"}</code> ·
-      <code>{"type":"s3","sink":"primary","prefix":"p"}</code> or with endpoint/bucket/accessKey/secretKey.</span></p>
-    <p><label>Filters (one per line, first match wins)<br><textarea name="filters" rows="3" placeholder="exclude:**/node_modules/**&#10;include:*.jpg&#10;exclude:**"></textarea></label></p>
-    <p><label><input type="checkbox" name="delete"> Delete destination files the source no longer has</label>
-      <span class="hint">(off by default; excluded files are never deleted)</span></p>
-    <p><label>Schedule (cron, blank = manual only) <input name="schedule" placeholder="@hourly"></label></p>
-    <p><input type="submit" value="Create sync job"></p>
+<dialog id="coverage-dialog">
+  <form method="dialog" class="dlg">
+    <h3>What isn't backed up?</h3>
+    <p class="hint">Every namespace of a cluster, what is in it and which backups cover it.</p>
+    <p><label>Cluster <select id="cov-cluster" onchange="loadCoverage()"></select></label></p>
+    <div id="cov-body" class="hint">Pick a cluster.</div>
+    <p class="buttons"><button value="close">Close</button></p>
   </form>
-</details>
+</dialog>
+
+<dialog id="target-dialog">
+  <form id="target-editor" class="dlg" onsubmit="return saveTarget(event)">
+    <h3 id="te-title">Back up a namespace</h3>
+    <input type="hidden" name="id">
+    <input type="hidden" name="type">
+
+    <fieldset class="k8s-only">
+      <legend>What to copy</legend>
+      <div class="field">
+        <label for="te-cluster">Cluster</label>
+        <select id="te-cluster" name="cluster" onchange="loadNamespaces()"></select>
+        <div class="help">The Kubernetes cluster to read. <em>spark</em> is the cluster backup-stack runs in; the others are reached with the kubeconfig files in the <code>backup-stack-kubeconfigs</code> Secret (one key per cluster).</div>
+      </div>
+      <div class="field">
+        <label for="te-ns">Namespace</label>
+        <select id="te-ns" name="namespace" onchange="showNamespace()"></select>
+        <div class="help">One namespace per backup. A namespace that already has a backup says so; you rarely want two.</div>
+      </div>
+      <div id="te-ns-info" class="ns-info"></div>
+      <div class="field">
+        <span class="label">Leave out</span>
+        <div id="te-kinds" class="kinds-grid"></div>
+        <div class="help">Everything is copied unless you tick it here. <strong>Secrets</strong> are needed to restore most apps; leave them out only if the destination must not hold passwords (they are stored as Kubernetes keeps them: base64, not encrypted).</div>
+      </div>
+    </fieldset>
+
+    <fieldset class="ssh-only">
+      <legend>What to copy</legend>
+      <div class="field">
+        <label for="te-host">Host</label>
+        <input id="te-host" name="host" placeholder="wopr.local" list="host-list">
+        <datalist id="host-list"><option value="wopr.local"><option value="spark.local"><option value="mp2.local"></datalist>
+        <div class="help">The machine to read from, by name or IP. It must be reachable from the backup-stack pod on spark.</div>
+      </div>
+      <div class="field row2">
+        <div><label for="te-port">Port</label><input id="te-port" name="port" type="number" min="1" max="65535" value="22"></div>
+        <div><label for="te-user">User</label><input id="te-user" name="user" placeholder="chris">
+          <div class="help">The account to log in as. Its <code>~/.ssh/authorized_keys</code> must hold backup-stack's public key, and it must be able to read every file you back up.</div></div>
+      </div>
+      <div class="field">
+        <label for="te-path">Directory</label>
+        <input id="te-path" name="path" placeholder="/etc">
+        <div class="help">An absolute path. Everything under it is copied (except what the filter rules leave out). Symlinks are not followed.</div>
+      </div>
+      <div class="field">
+        <label for="te-filters">Filter rules <span class="opt">optional</span></label>
+        <textarea id="te-filters" name="filters" rows="4" placeholder="exclude:**/*.tmp&#10;exclude:cache/**" oninput="checkFilters(this, 'te-filters-msg')"></textarea>
+        <div id="te-filters-msg" class="help"></div>
+        <div class="help">One rule per line, <code>include:pattern</code> or <code>exclude:pattern</code> (or <code>+ pattern</code> / <code>- pattern</code>). The <strong>first rule that matches</strong> a file decides; a file no rule matches is copied. Patterns are relative to the directory: <code>*</code> stays within one folder, <code>**</code> crosses folders, <code>?</code> is one character.
+          Examples: <code>exclude:**/node_modules/**</code> · <code>exclude:*.log</code> · only photos: <code>include:**/*.jpg</code> then <code>exclude:**</code>.</div>
+      </div>
+      <details class="advanced">
+        <summary>SSH keys (advanced)</summary>
+        <div class="field">
+          <label for="te-key">Private key file</label>
+          <input id="te-key" name="privateKeyPath" placeholder="(default: the backup-stack-ssh Secret's key)">
+          <div class="help">Leave blank to use <code>/etc/backup-stack/ssh/id_ed25519</code>, mounted from the <code>backup-stack-ssh</code> Secret.</div>
+        </div>
+        <div class="field">
+          <label for="te-kh">known_hosts file</label>
+          <input id="te-kh" name="knownHostsPath" placeholder="(default: the backup-stack-ssh Secret's known_hosts)">
+          <div class="help">Where the host's key is checked. Add a host with <code>ssh-keyscan host &gt;&gt; known_hosts</code> and update the Secret.</div>
+        </div>
+        <div class="field"><label><input type="checkbox" name="insecureSkipHostKeyCheck"> Don't check the host's key</label>
+          <div class="help warn">Only for a first test: anyone who can impersonate the host would receive the login.</div></div>
+      </details>
+    </fieldset>
+
+    <fieldset>
+      <legend>When and where</legend>
+      <div class="field">
+        <label for="te-sched-kind">Schedule</label>
+        <div class="sched">
+          <select id="te-sched-kind" onchange="schedChanged('te')">
+            <option value="manual">Only when I press Run now</option>
+            <option value="hourly">Every hour</option>
+            <option value="daily">Every day at</option>
+            <option value="weekly">Every week on</option>
+            <option value="custom">Custom (cron)</option>
+          </select>
+          <select id="te-sched-dow" onchange="schedChanged('te')"><option value="0">Sunday</option><option value="1">Monday</option><option value="2">Tuesday</option><option value="3">Wednesday</option><option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option></select>
+          <input id="te-sched-time" type="time" value="03:00" onchange="schedChanged('te')">
+          <input id="te-sched-cron" placeholder="15 3 * * *" oninput="schedChanged('te')">
+        </div>
+        <div id="te-sched-next" class="help"></div>
+        <div class="help">Times are in the server's time zone (UTC on spark). The first run is a full copy; later runs copy only what changed. Spread backups out (03:00, 03:15, …) so they don't all run at once. Cron is <code>minute hour day-of-month month day-of-week</code>, e.g. <code>15 3 * * *</code> = 03:15 daily, <code>0 */6 * * *</code> = every 6 hours.</div>
+      </div>
+      <div class="field">
+        <label for="te-sink">Destination</label>
+        <select id="te-sink" name="sinkRef"></select>
+        <div id="te-sink-info" class="help"></div>
+        <div class="help">The S3 bucket the copies go to. Destinations are set up on the server (<code>BACKUP_STACK_SINKS_JSON</code> or the <code>BACKUP_STACK_S3_*</code> settings); <em>primary</em> is wopr's MinIO.</div>
+      </div>
+      <div class="field">
+        <label for="te-name">Name</label>
+        <input id="te-name" name="name" required oninput="this.dataset.touched='1'">
+        <div class="help">How it appears in lists and history. Filled in from what you pick; change it if you like.</div>
+      </div>
+      <div class="field"><label><input type="checkbox" name="enabled" checked> Enabled</label>
+        <div class="help">A disabled backup keeps its settings and history but doesn't run on its schedule.</div></div>
+    </fieldset>
+    <div id="te-error" class="err-samples"></div>
+    <p class="buttons"><button type="button" onclick="closeDialog('target-dialog')">Cancel</button> <button type="submit" class="primary" id="te-save">Create backup</button></p>
+  </form>
+</dialog>
+
+<dialog id="sync-dialog">
+  <form id="sync-editor" class="dlg" onsubmit="return saveSync(event)">
+    <h3 id="se-title">Add sync job</h3>
+    <input type="hidden" name="id">
+    <fieldset>
+      <legend>From</legend>
+      <div id="se-src"></div>
+    </fieldset>
+    <fieldset>
+      <legend>To</legend>
+      <div id="se-dst"></div>
+    </fieldset>
+    <fieldset>
+      <legend>Which files</legend>
+      <div class="field">
+        <label for="se-filters">Filter rules <span class="opt">optional</span></label>
+        <textarea id="se-filters" name="filters" rows="4" placeholder="exclude:**/node_modules/**&#10;include:**/*.jpg&#10;exclude:**" oninput="checkFilters(this, 'se-filters-msg')"></textarea>
+        <div id="se-filters-msg" class="help"></div>
+        <div class="help">Same rules as backups: one per line, <code>include:</code> or <code>exclude:</code>, first match wins, unmatched files are copied. <code>*</code> stays in one folder, <code>**</code> crosses folders.</div>
+      </div>
+      <div class="field"><label><input type="checkbox" name="delete"> Delete files at the destination that the source no longer has</label>
+        <div class="help warn">Makes the destination an exact mirror. Something deleted (or lost) at the source is then deleted at the destination on the next run. Files your filters leave out are never deleted. Off by default.</div></div>
+    </fieldset>
+    <fieldset>
+      <legend>When</legend>
+      <div class="field">
+        <label for="se-sched-kind">Schedule</label>
+        <div class="sched">
+          <select id="se-sched-kind" onchange="schedChanged('se')">
+            <option value="manual">Only when I press Run now</option>
+            <option value="hourly">Every hour</option>
+            <option value="daily">Every day at</option>
+            <option value="weekly">Every week on</option>
+            <option value="custom">Custom (cron)</option>
+          </select>
+          <select id="se-sched-dow" onchange="schedChanged('se')"><option value="0">Sunday</option><option value="1">Monday</option><option value="2">Tuesday</option><option value="3">Wednesday</option><option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option></select>
+          <input id="se-sched-time" type="time" value="02:00" onchange="schedChanged('se')">
+          <input id="se-sched-cron" placeholder="0 * * * *" oninput="schedChanged('se')">
+        </div>
+        <div id="se-sched-next" class="help"></div>
+      </div>
+      <div class="field">
+        <label for="se-name">Name</label>
+        <input id="se-name" name="name" required oninput="this.dataset.touched='1'">
+      </div>
+      <div class="field"><label><input type="checkbox" name="enabled" checked> Enabled</label></div>
+    </fieldset>
+    <div id="se-error" class="err-samples"></div>
+    <p class="buttons"><button type="button" onclick="closeDialog('sync-dialog')">Cancel</button> <button type="submit" class="primary" id="se-save">Create sync job</button></p>
+  </form>
+</dialog>
 
 <h2>History and stats</h2>
 <div class="controls">
@@ -124,16 +311,16 @@
 </div>
 
 <h3 style="font-size:.95rem;margin-top:1.25rem">Per target / sync job</h3>
-<table id="owners-table">
+<div class="table-wrap"><table id="owners-table">
   <thead><tr><th>What</th><th class="num">Runs</th><th class="num">Failed</th><th class="num">Files</th><th class="num">Bytes</th><th class="num">Errors</th><th class="num">Avg rate</th></tr></thead>
   <tbody><tr><td colspan="7" class="hint">Loading…</td></tr></tbody>
-</table>
+</table></div>
 
 <h3 style="font-size:.95rem;margin-top:1.25rem">Runs</h3>
-<table id="history-table">
+<div class="table-wrap"><table id="history-table">
   <thead><tr><th>Started</th><th>What</th><th>Kind</th><th>State</th><th class="num">Duration</th><th class="num">Files</th><th class="num">Bytes</th><th class="num">Skipped</th><th class="num">Deleted</th><th class="num">Errors</th><th class="num">Rate</th></tr></thead>
   <tbody><tr><td colspan="11" class="hint">Loading…</td></tr></tbody>
-</table>
+</table></div>
 
 <script>
 // Every API path is relative (no leading "/"), so the page works at the
@@ -145,7 +332,7 @@ function getToken() { try { return localStorage.getItem(TOKEN_KEY) || ''; } catc
 function storeToken(t) { try { localStorage.setItem(TOKEN_KEY, t); } catch (e) {} }
 function setToken() {
   var t = prompt('backup-stack admin token (BACKUP_STACK_TOKEN):', getToken());
-  if (t !== null) { storeToken(t.trim()); renderTokenStatus(); loadStats(); }
+  if (t !== null) { storeToken(t.trim()); renderTokenStatus(); loadStats(); loadAll(); }
 }
 function renderTokenStatus() {
   if (proxied) {
@@ -190,38 +377,6 @@ function parseFilters(text) {
   });
   return out;
 }
-function runNow(id) { api('v1/targets/' + encodeURIComponent(id) + ':run', 'POST').then(okOrAlert('run')); }
-function runSync(id) { api('v1/sync-jobs/' + encodeURIComponent(id) + ':run', 'POST').then(okOrAlert('sync')); }
-function showHistory(id) {
-  var sel = document.getElementById('scope');
-  sel.value = 'owner=' + id; loadStats();
-  document.getElementById('scope').scrollIntoView({ behavior: 'smooth' });
-}
-function createTarget(ev) {
-  ev.preventDefault();
-  var f = ev.target, config, filters;
-  try { config = JSON.parse(f.config.value || '{}'); } catch (e) { alert('config is not valid JSON'); return false; }
-  try { filters = parseFilters(f.filters.value); } catch (e) { alert(e.message); return false; }
-  if (filters.length) config.filters = filters;
-  api('v1/targets', 'POST', { name: f.name.value, type: f.type.value, config: config, sinkRef: f.sinkRef.value, schedule: f.schedule.value })
-    .then(okOrAlert('create'));
-  return false;
-}
-function createSyncJob(ev) {
-  ev.preventDefault();
-  var f = ev.target, src, dst, filters;
-  try { src = JSON.parse(f.sourceConfig.value); dst = JSON.parse(f.destConfig.value); } catch (e) { alert('source/destination must be valid JSON'); return false; }
-  try { filters = parseFilters(f.filters.value); } catch (e) { alert(e.message); return false; }
-  api('v1/sync-jobs', 'POST', { name: f.name.value, sourceConfig: src, destConfig: dst, filters: filters, delete: f['delete'].checked, schedule: f.schedule.value })
-    .then(okOrAlert('create'));
-  return false;
-}
-function discover() {
-  api('v1/discover').then(function (r) { return r.json(); }).then(function (list) {
-    document.getElementById('discover-out').textContent = JSON.stringify(list, null, 2);
-  });
-}
-
 // ---- formatting ----
 function fmtBytes(n) {
   if (!n) return '0 B';
@@ -350,8 +505,515 @@ function loadStats() {
   api('v1/history?limit=200&' + q).then(function (r) { return r.ok ? r.json() : []; }).then(fillHistory);
 }
 
+// ---- backups and sync jobs: lists and editors ----
+var S = { clusters: [], kinds: [], sinks: [], targets: [], syncJobs: [], ns: {} };
+function jsonOrThrow(what) {
+  return function (r) {
+    if (!r.ok) return r.text().then(function (t) { var m = t; try { m = JSON.parse(t).error || t; } catch (e) {} throw new Error(what + ': ' + m); });
+    return r.status === 204 ? null : r.json();
+  };
+}
+function loadAll() {
+  return Promise.all([
+    api('v1/clusters').then(jsonOrThrow('clusters')).then(function (c) { S.clusters = c.clusters || []; S.kinds = c.kinds || []; }),
+    api('v1/sinks').then(jsonOrThrow('sinks')).then(function (s) { S.sinks = s || []; }),
+    api('v1/targets').then(jsonOrThrow('backups')).then(function (t) { S.targets = t || []; }),
+    api('v1/sync-jobs').then(jsonOrThrow('sync jobs')).then(function (j) { S.syncJobs = j || []; }),
+  ]).then(function () { renderTargets(); renderSyncJobs(); })
+    .catch(function (e) {
+      showError(e.message);
+      document.getElementById('targets-fallback').hidden = false;
+      document.getElementById('sync-fallback').hidden = false;
+    });
+}
+
+// A schedule in words.
+var DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+function pad2(n) { n = String(n); return n.length < 2 ? '0' + n : n; }
+function parseSchedule(expr) {
+  expr = (expr || '').trim();
+  if (!expr) return { kind: 'manual' };
+  if (expr === '@hourly' || expr === '0 * * * *') return { kind: 'hourly' };
+  if (expr === '@daily' || expr === '@midnight') return { kind: 'daily', time: '00:00' };
+  if (expr === '@weekly') return { kind: 'weekly', time: '00:00', dow: '0' };
+  var m = /^(\d{1,2}) (\d{1,2}) \* \* (\*|[0-6])$/.exec(expr);
+  if (m && +m[1] < 60 && +m[2] < 24) {
+    var t = pad2(m[2]) + ':' + pad2(m[1]);
+    return m[3] === '*' ? { kind: 'daily', time: t } : { kind: 'weekly', time: t, dow: m[3] };
+  }
+  return { kind: 'custom', cron: expr };
+}
+function scheduleWords(expr) {
+  var p = parseSchedule(expr);
+  switch (p.kind) {
+    case 'manual': return 'Manual only';
+    case 'hourly': return 'Every hour';
+    case 'daily': return 'Daily at ' + p.time;
+    case 'weekly': return DAYS[+p.dow] + 's at ' + p.time;
+    default: return 'Cron: ' + p.cron;
+  }
+}
+function schedExpr(pre) {
+  var kind = document.getElementById(pre + '-sched-kind').value;
+  var t = (document.getElementById(pre + '-sched-time').value || '00:00').split(':');
+  switch (kind) {
+    case 'manual': return '';
+    case 'hourly': return '0 * * * *';
+    case 'daily': return (+t[1]) + ' ' + (+t[0]) + ' * * *';
+    case 'weekly': return (+t[1]) + ' ' + (+t[0]) + ' * * ' + document.getElementById(pre + '-sched-dow').value;
+    default: return document.getElementById(pre + '-sched-cron').value.trim();
+  }
+}
+function setSchedule(pre, expr) {
+  var p = parseSchedule(expr);
+  document.getElementById(pre + '-sched-kind').value = p.kind;
+  if (p.time) document.getElementById(pre + '-sched-time').value = p.time;
+  if (p.dow) document.getElementById(pre + '-sched-dow').value = p.dow;
+  document.getElementById(pre + '-sched-cron').value = p.cron || expr || '';
+  schedChanged(pre);
+}
+var schedTimer = {};
+function schedChanged(pre) {
+  var kind = document.getElementById(pre + '-sched-kind').value;
+  document.getElementById(pre + '-sched-time').hidden = !(kind === 'daily' || kind === 'weekly');
+  document.getElementById(pre + '-sched-dow').hidden = kind !== 'weekly';
+  document.getElementById(pre + '-sched-cron').hidden = kind !== 'custom';
+  var out = document.getElementById(pre + '-sched-next'), expr = schedExpr(pre);
+  if (!expr) { out.textContent = 'It runs only when you press Run now.'; out.className = 'help'; return; }
+  clearTimeout(schedTimer[pre]);
+  schedTimer[pre] = setTimeout(function () {
+    api('v1/schedule?expr=' + encodeURIComponent(expr)).then(function (r) { return r.json(); }).then(function (s) {
+      if (!s.valid) { out.textContent = 'Not a valid schedule: ' + s.error; out.className = 'help warn'; return; }
+      out.className = 'help';
+      out.textContent = 'Cron ' + expr + ' · next runs: ' + s.next.map(function (t) { return new Date(t).toLocaleString([], { weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }); }).join(', ');
+    });
+  }, 250);
+}
+
+function checkFilters(ta, msgId) {
+  var msg = document.getElementById(msgId);
+  try {
+    var rules = parseFilters(ta.value);
+    msg.className = 'help';
+    msg.textContent = rules.length ? rules.length + ' rule' + (rules.length === 1 ? '' : 's') + ': ' + rules.map(function (r) { return (r.kind === 'include' ? '+ ' : '− ') + r.pattern; }).join(' · ') : '';
+    return rules;
+  } catch (e) { msg.className = 'help warn'; msg.textContent = e.message; return null; }
+}
+function filtersText(rules) { return (rules || []).map(function (r) { return r.kind + ':' + r.pattern; }).join('\n'); }
+
+function lastRunCell(run) {
+  var td = el('td');
+  if (!run) { td.appendChild(el('span', { 'class': 'badge badge-never' }, 'never run')); return td; }
+  td.appendChild(el('span', { 'class': 'badge badge-' + run.state }, run.state === 'succeeded' ? 'ok (' + run.kind + ')' : run.state));
+  td.appendChild(el('div', { 'class': 'hint' }, fmtTime(run.startedAt, false) + (run.files ? ' · ' + fmtNum(run.files) + ' files' : '') + (run.bytes ? ' · ' + fmtBytes(run.bytes) : '')));
+  if (run.error) td.appendChild(el('div', { 'class': 'err-samples' }, run.error));
+  return td;
+}
+function button(text, fn, cls) { var b = el('button', { type: 'button' }, text); if (cls) b.className = cls; b.onclick = fn; return b; }
+function sinkWords(ref) {
+  var name = ref || 'primary', s = S.sinks.filter(function (x) { return x.name === name; })[0];
+  return s ? name + ' (' + s.bucket + (s.prefix ? '/' + s.prefix : '') + ')' : name;
+}
+
+function renderTargets() {
+  var root = document.getElementById('targets-rich');
+  root.innerHTML = '';
+  if (!S.targets.length) { root.appendChild(el('p', { 'class': 'hint' }, 'No backups yet. Start with “Back up a namespace”.')); return; }
+  // Group: cluster or host, then namespace.
+  var groups = {};
+  S.targets.forEach(function (t) {
+    var g = (t.type === 'k8s-namespace' ? 'Cluster ' : 'Host ') + (t.cluster || '?');
+    (groups[g] = groups[g] || []).push(t);
+  });
+  Object.keys(groups).sort().forEach(function (g) {
+    root.appendChild(el('h3', { 'class': 'group' }, g));
+    var table = el('table', { 'class': 'targets' });
+    var head = el('tr');
+    ['Namespace / path', 'What it copies', 'Schedule', 'Destination', 'Last run', ''].forEach(function (h) { head.appendChild(el('th', {}, h)); });
+    table.appendChild(el('thead')).appendChild(head);
+    var tb = el('tbody');
+    groups[g].sort(function (a, b) { return (a.namespaces || [a.name]).join(',').localeCompare((b.namespaces || [b.name]).join(',')); }).forEach(function (t) {
+      var tr = el('tr', t.enabled ? {} : { 'class': 'disabled' });
+      var where = el('td');
+      where.appendChild(el('strong', {}, t.type === 'k8s-namespace' ? (t.namespaces || []).join(', ') : (t.config.path || '')));
+      where.appendChild(el('div', { 'class': 'hint' }, t.name + (t.enabled ? '' : ' · disabled')));
+      tr.appendChild(where);
+      var what = el('td');
+      what.appendChild(el('span', { 'class': 'what ' + (t.type === 'k8s-namespace' ? 'what-k8s' : 'what-ssh') }, t.what));
+      what.appendChild(el('div', { 'class': 'hint copies' }, t.copies));
+      tr.appendChild(what);
+      tr.appendChild(el('td', {}, scheduleWords(t.schedule)));
+      tr.appendChild(el('td', {}, sinkWords(t.sinkRef)));
+      tr.appendChild(lastRunCell(t.lastRun));
+      var act = el('td', { 'class': 'actions' });
+      act.appendChild(button('Run now', function () { runNow(t.id, this); }));
+      act.appendChild(button('History', function () { showHistory(t.id); }));
+      act.appendChild(button('Edit', function () { openTargetEditor(t.type, t); }));
+      act.appendChild(button(t.enabled ? 'Disable' : 'Enable', function () { setEnabled('targets', t, !t.enabled); }));
+      act.appendChild(button('Delete', function () { deleteTarget(t); }, 'danger'));
+      tr.appendChild(act);
+      tb.appendChild(tr);
+    });
+    table.appendChild(tb);
+    var wrap = el('div', { 'class': 'table-wrap' }); wrap.appendChild(table); root.appendChild(wrap);
+  });
+}
+
+function renderSyncJobs() {
+  var root = document.getElementById('sync-rich');
+  root.innerHTML = '';
+  if (!S.syncJobs.length) { root.appendChild(el('p', { 'class': 'hint' }, 'No sync jobs yet.')); return; }
+  var table = el('table', { 'class': 'targets' });
+  var head = el('tr');
+  ['Name', 'From → to', 'Which files', 'Schedule', 'Last run', ''].forEach(function (h) { head.appendChild(el('th', {}, h)); });
+  table.appendChild(el('thead')).appendChild(head);
+  var tb = el('tbody');
+  S.syncJobs.forEach(function (j) {
+    var tr = el('tr', j.enabled ? {} : { 'class': 'disabled' });
+    var n = el('td'); n.appendChild(el('strong', {}, j.name)); n.appendChild(el('div', { 'class': 'hint' }, j.kind + (j.enabled ? '' : ' · disabled'))); tr.appendChild(n);
+    tr.appendChild(el('td', {}, (j.from || '?') + ' → ' + (j.to || '?')));
+    var nf = (j.filters || []).length;
+    tr.appendChild(el('td', {}, (nf ? nf + ' rule' + (nf === 1 ? '' : 's') : 'everything') + (j.delete ? ' · mirrors deletes' : '')));
+    tr.appendChild(el('td', {}, scheduleWords(j.schedule)));
+    var lr = el('td');
+    lr.appendChild(el('span', { 'class': 'badge badge-' + (j.lastRunState || 'never') }, j.lastRunState || 'never run'));
+    if (j.lastRunError) lr.appendChild(el('div', { 'class': 'err-samples' }, j.lastRunError));
+    tr.appendChild(lr);
+    var act = el('td', { 'class': 'actions' });
+    act.appendChild(button('Run now', function () { runSync(j.id, this); }));
+    act.appendChild(button('History', function () { showHistory(j.id); }));
+    act.appendChild(button('Edit', function () { openSyncEditor(j); }));
+    act.appendChild(button(j.enabled ? 'Disable' : 'Enable', function () { setEnabled('sync-jobs', j, !j.enabled); }));
+    act.appendChild(button('Delete', function () { deleteSync(j); }, 'danger'));
+    tr.appendChild(act);
+    tb.appendChild(tr);
+  });
+  table.appendChild(tb);
+  var wrap = el('div', { 'class': 'table-wrap' }); wrap.appendChild(table); root.appendChild(wrap);
+}
+
+function runNow(id, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Running…'; }
+  api('v1/targets/' + encodeURIComponent(id) + ':run', 'POST').then(jsonOrThrow('run'))
+    .then(function () { return loadAll(); }).then(loadStats)
+    .catch(function (e) { alert(e.message); if (btn) { btn.disabled = false; btn.textContent = 'Run now'; } });
+}
+function runSync(id, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Running…'; }
+  api('v1/sync-jobs/' + encodeURIComponent(id) + ':run', 'POST').then(jsonOrThrow('sync'))
+    .then(function () { return loadAll(); }).then(loadStats)
+    .catch(function (e) { alert(e.message); if (btn) { btn.disabled = false; btn.textContent = 'Run now'; } });
+}
+function setEnabled(kind, obj, on) {
+  api('v1/' + kind + '/' + encodeURIComponent(obj.id), 'PUT', { enabled: on }).then(jsonOrThrow(on ? 'enable' : 'disable')).then(loadAll)
+    .catch(function (e) { alert(e.message); });
+}
+function deleteTarget(t) {
+  var msg = 'Delete the backup “' + t.name + '”?\n\nThis removes its settings and its run history. The copies already in the bucket stay, but they can no longer be restored from here, because the history is what says which runs form a chain.\n\nTo stop it running but keep what it has, press Cancel and use Disable instead.';
+  if (!confirm(msg)) return;
+  api('v1/targets/' + encodeURIComponent(t.id), 'DELETE').then(jsonOrThrow('delete')).then(loadAll).then(loadStats).catch(function (e) { alert(e.message); });
+}
+function deleteSync(j) {
+  if (!confirm('Delete the sync job “' + j.name + '” and its run history? Files it already copied stay where they are.')) return;
+  api('v1/sync-jobs/' + encodeURIComponent(j.id), 'DELETE').then(jsonOrThrow('delete')).then(loadAll).then(loadStats).catch(function (e) { alert(e.message); });
+}
+function showHistory(id) {
+  var sel = document.getElementById('scope');
+  var have = Array.prototype.some.call(sel.options, function (o) { return o.value === 'owner=' + id; });
+  if (!have) sel.appendChild(el('option', { value: 'owner=' + id }, id));
+  sel.value = 'owner=' + id; loadStats();
+  sel.scrollIntoView({ behavior: 'smooth' });
+}
+function closeDialog(id) { document.getElementById(id).close(); }
+
+// ---- the backup editor ----
+var editing = null;
+function fillSelect(sel, items, value) {
+  sel.innerHTML = '';
+  items.forEach(function (it) { var o = el('option', { value: it[0] }, it[1]); sel.appendChild(o); });
+  if (value !== undefined) sel.value = value;
+}
+function clusterByPath(path) { return S.clusters.filter(function (c) { return c.kubeconfigPath === (path || ''); })[0]; }
+function openTargetEditor(type, t) {
+  editing = t || null;
+  var f = document.getElementById('target-editor');
+  f.reset();
+  f.id.value = t ? t.id : ''; f.type.value = type;
+  f.name.value = t ? t.name : '';
+  f.name.dataset.touched = t ? '1' : '';
+  document.getElementById('te-error').textContent = '';
+  document.getElementById('te-title').textContent = (t ? 'Edit: ' : '') + (type === 'k8s-namespace' ? (t ? t.name : 'Back up a namespace') : (t ? t.name : 'Back up files over SSH'));
+  document.getElementById('te-save').textContent = t ? 'Save changes' : 'Create backup';
+  f.querySelectorAll('.k8s-only').forEach(function (x) { x.hidden = type !== 'k8s-namespace'; });
+  f.querySelectorAll('.ssh-only').forEach(function (x) { x.hidden = type !== 'ssh-path'; });
+  var cfg = (t && t.config) || {};
+  fillSelect(document.getElementById('te-sink'), (S.sinks.length ? S.sinks : [{ name: 'primary' }]).map(function (s) { return [s.name, s.name + (s.bucket ? ' — ' + s.endpoint + ' / ' + s.bucket : '')]; }), (t && t.sinkRef) || 'primary');
+  sinkInfo();
+  document.getElementById('te-sink').onchange = sinkInfo;
+  f.enabled.checked = t ? t.enabled : true;
+  setSchedule('te', t ? t.schedule : '');
+  if (type === 'k8s-namespace') {
+    if (!t) { document.getElementById('te-sched-kind').value = 'daily'; document.getElementById('te-sched-time').value = suggestTime(); schedChanged('te'); }
+    fillSelect(document.getElementById('te-cluster'), S.clusters.map(function (c) { return [c.name, c.name + (c.local ? ' (where backup-stack runs)' : '')]; }));
+    var c = clusterByPath(cfg.kubeconfigPath);
+    if (c) document.getElementById('te-cluster').value = c.name;
+    var kinds = document.getElementById('te-kinds'); kinds.innerHTML = '';
+    S.kinds.forEach(function (k) {
+      var lab = el('label', { title: k.about });
+      var cb = el('input', { type: 'checkbox', name: 'exclude', value: k.name });
+      if ((cfg.excludeKinds || []).indexOf(k.name) >= 0) cb.checked = true;
+      lab.appendChild(cb); lab.appendChild(document.createTextNode(' ' + k.name)); lab.appendChild(el('span', { 'class': 'hint' }, ' — ' + k.about));
+      kinds.appendChild(lab);
+    });
+    loadNamespaces((cfg.namespaces || [])[0]);
+  } else {
+    var addr = (cfg.addr || '').split(':');
+    f.host.value = addr[0] || ''; f.port.value = addr[1] || '22';
+    f.user.value = cfg.user || ''; f.path.value = cfg.path || '';
+    f.filters.value = filtersText(cfg.filters); checkFilters(f.filters, 'te-filters-msg');
+    f.privateKeyPath.value = cfg.privateKeyPath || ''; f.knownHostsPath.value = cfg.knownHostsPath || '';
+    f.insecureSkipHostKeyCheck.checked = !!cfg.insecureSkipHostKeyCheck;
+    ['host', 'path'].forEach(function (n) { f[n].oninput = suggestName; });
+  }
+  document.getElementById('target-dialog').showModal();
+}
+// The next free quarter hour after 03:00 among scheduled daily backups.
+function suggestTime() {
+  var used = {};
+  S.targets.forEach(function (t) { var p = parseSchedule(t.schedule); if (p.time) used[p.time] = true; });
+  for (var m = 180; m < 360; m += 15) { var t = pad2(Math.floor(m / 60)) + ':' + pad2(m % 60); if (!used[t]) return t; }
+  return '03:00';
+}
+function sinkInfo() {
+  var name = document.getElementById('te-sink').value, s = S.sinks.filter(function (x) { return x.name === name; })[0];
+  document.getElementById('te-sink-info').textContent = s ? 'Copies go to ' + s.endpoint + ', bucket ' + s.bucket + (s.prefix ? ', under ' + s.prefix : '') + '.' : '';
+}
+function suggestName() {
+  var f = document.getElementById('target-editor');
+  if (f.name.dataset.touched) return;
+  if (f.type.value === 'k8s-namespace') {
+    var ns = document.getElementById('te-ns').value;
+    if (ns) f.name.value = document.getElementById('te-cluster').value + '/' + ns + ' objects';
+  } else if (f.host.value && f.path.value) {
+    f.name.value = f.host.value.replace(/\.local$/, '') + ':' + f.path.value;
+  }
+}
+function loadNamespaces(select) {
+  var cluster = document.getElementById('te-cluster').value, sel = document.getElementById('te-ns');
+  fillSelect(sel, [['', 'Reading ' + cluster + '…']]);
+  document.getElementById('te-ns-info').innerHTML = '';
+  var p = S.ns[cluster] ? Promise.resolve(S.ns[cluster]) :
+    api('v1/clusters/' + encodeURIComponent(cluster) + '/namespaces').then(jsonOrThrow(cluster)).then(function (r) { S.ns[cluster] = r.namespaces; return r.namespaces; });
+  p.then(function (list) {
+    fillSelect(sel, [['', '— pick a namespace —']].concat(list.map(function (n) {
+      var others = n.covered.filter(function (c) { return !editing || c.id !== editing.id; });
+      return [n.name, n.name + (others.length ? '  ✓ backed up' : '')];
+    })), select || '');
+    if (select && sel.value !== select) { sel.appendChild(el('option', { value: select }, select + ' (not found now)')); sel.value = select; }
+    showNamespace();
+  }).catch(function (e) { fillSelect(sel, [['', 'Could not read the cluster']]); document.getElementById('te-ns-info').textContent = e.message; });
+}
+function showNamespace() {
+  var cluster = document.getElementById('te-cluster').value, name = document.getElementById('te-ns').value;
+  var box = document.getElementById('te-ns-info'); box.innerHTML = '';
+  suggestName();
+  var n = (S.ns[cluster] || []).filter(function (x) { return x.name === name; })[0];
+  if (!n) return;
+  box.appendChild(nsSummary(n, editing && editing.id));
+}
+// What is in a namespace and what of it a backup covers.
+function nsSummary(n, selfId) {
+  var box = el('div');
+  var objs = Object.keys(n.objects).sort().map(function (k) { return n.objects[k] + ' ' + k + (n.objects[k] === 1 ? '' : 's'); });
+  var p = el('p'); p.appendChild(el('strong', {}, 'Objects: ')); p.appendChild(document.createTextNode(objs.length ? objs.join(', ') : 'none')); box.appendChild(p);
+  var others = n.covered.filter(function (c) { return c.id !== selfId; });
+  if (others.length) {
+    box.appendChild(el('p', { 'class': 'warn' }, 'Already backed up by: ' + others.map(function (c) { return c.name + (c.enabled ? '' : ' (disabled)'); }).join(', ') + '.'));
+  }
+  if (n.volumes.length) {
+    var vp = el('div'); vp.appendChild(el('strong', {}, 'Volumes '));
+    vp.appendChild(el('span', { 'class': 'hint' }, '(the claims are saved with the objects; the files on them are not — volume backups come next)'));
+    var ul = el('ul');
+    n.volumes.forEach(function (v) {
+      ul.appendChild(el('li', {}, v.claim + ' — ' + [v.size, v.storageClass].filter(Boolean).join(', ') +
+        (v.usedBy && v.usedBy.length ? ' · used by ' + v.usedBy.join(', ') : ' · not mounted by anything') +
+        (v.database ? ' · holds a ' + v.database + ' database' : '')));
+    });
+    vp.appendChild(ul); box.appendChild(vp);
+  }
+  if (n.databases.length) {
+    var dp = el('div'); dp.appendChild(el('strong', {}, 'Databases '));
+    dp.appendChild(el('span', { 'class': 'hint' }, '(their contents are not in an objects backup — database dumps come next)'));
+    var dl = el('ul');
+    n.databases.forEach(function (d) { dl.appendChild(el('li', {}, d.engine + ' in ' + d.workload + ' (' + d.image + ')' + (d.volumes && d.volumes.length ? ' on ' + d.volumes.join(', ') : ''))); });
+    dp.appendChild(dl); box.appendChild(dp);
+  }
+  return box;
+}
+function saveTarget(ev) {
+  ev.preventDefault();
+  var f = ev.target, type = f.type.value, cfg, err = document.getElementById('te-error');
+  err.textContent = '';
+  if (type === 'k8s-namespace') {
+    var c = S.clusters.filter(function (x) { return x.name === f.cluster.value; })[0];
+    if (!f.namespace.value) { err.textContent = 'Pick a namespace.'; return false; }
+    cfg = { kubeconfigPath: c ? c.kubeconfigPath : '', namespaces: [f.namespace.value],
+      excludeKinds: Array.prototype.filter.call(f.querySelectorAll('input[name=exclude]'), function (x) { return x.checked; }).map(function (x) { return x.value; }) };
+  } else {
+    var rules = checkFilters(f.filters, 'te-filters-msg');
+    if (rules === null) { err.textContent = 'Fix the filter rules first.'; return false; }
+    if (!f.host.value || !f.path.value) { err.textContent = 'A host and a directory are needed.'; return false; }
+    cfg = { addr: f.host.value.trim() + ':' + (f.port.value || '22'), user: f.user.value.trim(), path: f.path.value.trim(), filters: rules };
+    if (f.privateKeyPath.value) cfg.privateKeyPath = f.privateKeyPath.value.trim();
+    if (f.knownHostsPath.value) cfg.knownHostsPath = f.knownHostsPath.value.trim();
+    if (f.insecureSkipHostKeyCheck.checked) cfg.insecureSkipHostKeyCheck = true;
+  }
+  var body = { name: f.name.value.trim(), type: type, config: cfg, sinkRef: f.sinkRef.value, schedule: schedExpr('te'), enabled: f.enabled.checked };
+  var id = f.id.value;
+  api(id ? 'v1/targets/' + encodeURIComponent(id) : 'v1/targets', id ? 'PUT' : 'POST', body).then(jsonOrThrow(id ? 'save' : 'create'))
+    .then(function () { closeDialog('target-dialog'); S.ns = {}; return loadAll(); })
+    .catch(function (e) { err.textContent = e.message; });
+  return false;
+}
+
+// ---- coverage ----
+function openCoverage() {
+  fillSelect(document.getElementById('cov-cluster'), S.clusters.map(function (c) { return [c.name, c.name]; }));
+  document.getElementById('coverage-dialog').showModal();
+  loadCoverage();
+}
+function loadCoverage() {
+  var cluster = document.getElementById('cov-cluster').value, body = document.getElementById('cov-body');
+  body.textContent = 'Reading ' + cluster + '…';
+  api('v1/clusters/' + encodeURIComponent(cluster) + '/namespaces').then(jsonOrThrow(cluster)).then(function (r) {
+    S.ns[cluster] = r.namespaces;
+    body.innerHTML = '';
+    r.namespaces.forEach(function (n) {
+      var d = el('details', { 'class': 'cov' });
+      var on = n.covered.filter(function (c) { return c.enabled; }).length;
+      var gaps = n.volumes.length + n.databases.length;
+      var s = el('summary');
+      s.appendChild(el('strong', {}, n.name + ' '));
+      s.appendChild(el('span', { 'class': 'badge ' + (on ? 'badge-succeeded' : 'badge-failed') }, on ? 'objects backed up' : 'objects not backed up'));
+      if (gaps) s.appendChild(el('span', { 'class': 'badge badge-running' }, gaps + ' volume/database' + (gaps === 1 ? '' : 's') + ' not backed up'));
+      d.appendChild(s);
+      d.appendChild(nsSummary(n));
+      if (!on) d.appendChild(button('Back up ' + n.name, function () {
+        closeDialog('coverage-dialog');
+        openTargetEditor('k8s-namespace');
+        document.getElementById('te-cluster').value = cluster;
+        loadNamespaces(n.name);
+      }));
+      body.appendChild(d);
+    });
+  }).catch(function (e) { body.textContent = e.message; });
+}
+
+// ---- the sync job editor ----
+var EP_HELP = {
+  dir: 'A directory inside the backup-stack pod (only useful for a volume mounted into it).',
+  ssh: 'A directory on another machine, over SSH with the backup-stack-ssh key.',
+  s3: 'A bucket: one of the configured destinations, or any S3 endpoint with its own keys.',
+};
+function endpointEditor(rootId, e) {
+  e = e || { type: 'ssh' };
+  if (!e.type) e.type = 's3';
+  var root = document.getElementById(rootId); root.innerHTML = '';
+  var typeSel = el('select', { 'data-k': 'type' });
+  [['ssh', 'A directory on a host (SSH)'], ['s3', 'An S3 bucket'], ['dir', 'A directory in the backup-stack pod']].forEach(function (o) { typeSel.appendChild(el('option', { value: o[0] }, o[1])); });
+  typeSel.value = e.type;
+  var help = el('div', { 'class': 'help' }, EP_HELP[e.type]);
+  var fields = el('div');
+  function f(label, key, val, ph, hint, type) {
+    var d = el('div', { 'class': 'field' });
+    d.appendChild(el('label', {}, label));
+    var i = el('input', { 'data-k': key, placeholder: ph || '' });
+    if (type) i.setAttribute('type', type);
+    if (type === 'checkbox') i.checked = !!val; else i.value = val || '';
+    d.appendChild(i);
+    if (hint) d.appendChild(el('div', { 'class': 'help' }, hint));
+    fields.appendChild(d);
+  }
+  function draw() {
+    fields.innerHTML = '';
+    help.textContent = EP_HELP[typeSel.value];
+    if (typeSel.value === 'ssh') {
+      f('Host and port', 'addr', e.addr, 'wopr.local:22', 'host:port of the machine, reachable from the backup-stack pod.');
+      f('User', 'user', e.user, 'chris', 'Its authorized_keys must hold backup-stack\'s public key.');
+      f('Directory', 'path', e.path, '/srv/photos', 'Absolute path. On the destination side it is created if missing.');
+    } else if (typeSel.value === 's3') {
+      var d = el('div', { 'class': 'field' });
+      d.appendChild(el('label', {}, 'Destination'));
+      var s = el('select', { 'data-k': 'sink' });
+      s.appendChild(el('option', { value: '' }, 'Another endpoint (enter it below)'));
+      S.sinks.forEach(function (x) { s.appendChild(el('option', { value: x.name }, x.name + ' — ' + x.endpoint + ' / ' + x.bucket)); });
+      s.value = e.sink || (e.endpoint ? '' : (S.sinks[0] ? S.sinks[0].name : ''));
+      d.appendChild(s);
+      d.appendChild(el('div', { 'class': 'help' }, 'A configured destination brings its own endpoint and keys. Choose “another endpoint” for a bucket that isn\'t one.'));
+      fields.appendChild(d);
+      f('Folder (prefix)', 'prefix', e.prefix, 'mirror/photos', 'Where in the bucket the files go, so several jobs can share one bucket.');
+      var other = el('div', { 'class': 'other-s3' });
+      fields.appendChild(other);
+      var keep = fields; fields = other;
+      f('Endpoint', 'endpoint', e.endpoint, 'http://nas.local:9000', 'The S3 server\'s URL.');
+      f('Bucket', 'bucket', e.bucket, 'offsite');
+      f('Access key', 'accessKey', e.accessKey, '');
+      f('Secret key', 'secretKey', e.secretKey, '', 'Stored in backup-stack\'s database. Prefer a configured destination, whose keys live in a Secret.', 'password');
+      f('Use TLS (https)', 'useSSL', e.useSSL, '', '', 'checkbox');
+      fields = keep;
+      var toggle = function () { other.hidden = !!s.value; };
+      s.onchange = toggle; toggle();
+    } else {
+      f('Directory', 'path', e.path, '/data/x', 'An absolute path inside the backup-stack container.');
+    }
+  }
+  typeSel.onchange = function () { e = { type: typeSel.value }; draw(); };
+  var td = el('div', { 'class': 'field' }); td.appendChild(el('label', {}, 'Kind')); td.appendChild(typeSel); td.appendChild(help);
+  root.appendChild(td); root.appendChild(fields);
+  draw();
+}
+function readEndpoint(rootId) {
+  var out = {};
+  document.getElementById(rootId).querySelectorAll('[data-k]').forEach(function (i) {
+    if (i.closest('[hidden]')) return;
+    var k = i.getAttribute('data-k');
+    if (i.type === 'checkbox') { if (i.checked) out[k] = true; } else if (i.value.trim() !== '') out[k] = i.value.trim();
+  });
+  return out;
+}
+function openSyncEditor(j) {
+  var f = document.getElementById('sync-editor');
+  f.reset(); f.id.value = j ? j.id : '';
+  f.name.dataset.touched = j ? '1' : '';
+  document.getElementById('se-error').textContent = '';
+  document.getElementById('se-title').textContent = j ? 'Edit: ' + j.name : 'Add sync job';
+  document.getElementById('se-save').textContent = j ? 'Save changes' : 'Create sync job';
+  endpointEditor('se-src', j ? j.sourceConfig : { type: 'ssh' });
+  endpointEditor('se-dst', j ? j.destConfig : { type: 's3', sink: S.sinks[0] ? S.sinks[0].name : '' });
+  f.filters.value = j ? filtersText(j.filters) : ''; checkFilters(f.filters, 'se-filters-msg');
+  f['delete'].checked = !!(j && j.delete);
+  f.enabled.checked = j ? j.enabled : true;
+  f.name.value = j ? j.name : '';
+  setSchedule('se', j ? j.schedule : '');
+  document.getElementById('sync-dialog').showModal();
+}
+function saveSync(ev) {
+  ev.preventDefault();
+  var f = ev.target, err = document.getElementById('se-error');
+  err.textContent = '';
+  var rules = checkFilters(f.filters, 'se-filters-msg');
+  if (rules === null) { err.textContent = 'Fix the filter rules first.'; return false; }
+  var body = { name: f.name.value.trim(), sourceConfig: readEndpoint('se-src'), destConfig: readEndpoint('se-dst'), filters: rules,
+    delete: f['delete'].checked, schedule: schedExpr('se'), enabled: f.enabled.checked };
+  var id = f.id.value;
+  api(id ? 'v1/sync-jobs/' + encodeURIComponent(id) : 'v1/sync-jobs', id ? 'PUT' : 'POST', body).then(jsonOrThrow(id ? 'save' : 'create'))
+    .then(function () { closeDialog('sync-dialog'); return loadAll(); })
+    .catch(function (e) { err.textContent = e.message; });
+  return false;
+}
+
 renderTokenStatus();
-if (!proxied && !getToken()) { prompted = true; setToken(); } else { loadStats(); }
+if (!proxied && !getToken()) { prompted = true; setToken(); } else { loadStats(); loadAll(); }
 </script>
 </body>
 </html>

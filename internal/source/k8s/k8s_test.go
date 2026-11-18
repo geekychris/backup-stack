@@ -2,6 +2,9 @@ package k8s
 
 import (
 	"context"
+	"encoding/json"
+	"io"
+	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -94,5 +97,57 @@ func TestK8sSourceExcludeKinds(t *testing.T) {
 	}
 	if len(cat.Items) != 2 {
 		t.Fatalf("got %d items, want 2 (ConfigMap+Deployment): %+v", len(cat.Items), cat.Items)
+	}
+}
+
+func TestK8sSourceEveryKindCleanedForRestore(t *testing.T) {
+	ctrl := true
+	cli := fake.NewSimpleClientset(
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "db", Namespace: "wiki", UID: "u1", ResourceVersion: "9",
+			Annotations: map[string]string{"kubectl.kubernetes.io/last-applied-configuration": "{}"}},
+			Spec: corev1.ServiceSpec{ClusterIP: "10.152.183.191", ClusterIPs: []string{"10.152.183.191"}, Ports: []corev1.ServicePort{{Port: 33060}}}},
+		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "wikidb-pv-claim", Namespace: "wiki"},
+			Spec: corev1.PersistentVolumeClaimSpec{VolumeName: "wikidb-pv-volume"}, Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound}},
+		&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "mysql", Namespace: "wiki"}},
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "kube-root-ca.crt", Namespace: "wiki"}},
+		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "wiki"}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "tok", Namespace: "wiki"}, Type: corev1.SecretTypeServiceAccountToken},
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "owned", Namespace: "wiki",
+			OwnerReferences: []metav1.OwnerReference{{Kind: "Deployment", Name: "x", Controller: &ctrl}}}},
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "elsewhere", Namespace: "other"}},
+	)
+	src := New(Config{Client: cli, Namespaces: []string{"wiki"}})
+	cat, err := src.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, it := range cat.Items {
+		paths = append(paths, it.Path)
+	}
+	want := []string{"PersistentVolumeClaim/wiki/wikidb-pv-claim", "Service/wiki/db", "StatefulSet/wiki/mysql"}
+	if strings.Join(paths, ",") != strings.Join(want, ",") {
+		t.Fatalf("paths = %v, want %v (defaults, tokens and owned objects left out)", paths, want)
+	}
+
+	rc, err := src.Open(context.Background(), "Service/wiki/db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(rc)
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	meta := m["metadata"].(map[string]any)
+	spec := m["spec"].(map[string]any)
+	if m["kind"] != "Service" || m["apiVersion"] != "v1" || meta["uid"] != nil || meta["resourceVersion"] != nil ||
+		meta["annotations"] != nil || spec["clusterIP"] != nil || spec["clusterIPs"] != nil || m["status"] != nil {
+		t.Fatalf("service not cleaned for restore: %s", b)
+	}
+	rc, _ = src.Open(context.Background(), "PersistentVolumeClaim/wiki/wikidb-pv-claim")
+	b, _ = io.ReadAll(rc)
+	if strings.Contains(string(b), "wikidb-pv-volume") || strings.Contains(string(b), "Bound") {
+		t.Fatalf("claim keeps its binding: %s", b)
 	}
 }

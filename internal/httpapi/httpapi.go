@@ -19,9 +19,11 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"k8s.io/client-go/kubernetes"
 
 	"github.com/geekychris/backup-stack/internal/backup"
 	"github.com/geekychris/backup-stack/internal/cloudstackinfra"
+	"github.com/geekychris/backup-stack/internal/clusters"
 	"github.com/geekychris/backup-stack/internal/filter"
 	"github.com/geekychris/backup-stack/internal/runstats"
 	"github.com/geekychris/backup-stack/internal/sink"
@@ -51,6 +53,13 @@ type Deps struct {
 	// Infra discovers backup-target candidates from cloud-stack's infra
 	// registry; nil disables GET /v1/discover.
 	Infra *cloudstackinfra.Client
+	// Clusters lists the clusters a k8s-namespace target can name; nil
+	// disables /v1/clusters and the check that a target names a known one.
+	Clusters *clusters.Registry
+	// KubeClient connects to a cluster by kubeconfig path ("" = in-cluster).
+	KubeClient func(kubeconfigPath string) (kubernetes.Interface, error)
+	// Sinks describes the configured destinations (no credentials).
+	Sinks []SinkInfo
 	// Token is the single bearer token every request must present.
 	Token  string
 	Logger *slog.Logger
@@ -90,6 +99,11 @@ func New(d Deps) *Server {
 			r.Get("/stats", s.stats)
 
 			r.Get("/discover", s.discover)
+
+			r.Get("/clusters", s.listClusters)
+			r.Get("/clusters/{name}/namespaces", s.clusterNamespaces)
+			r.Get("/sinks", s.listSinks)
+			r.Get("/schedule", s.previewSchedule)
 		})
 	})
 	s.mux = r
@@ -143,6 +157,16 @@ func writeStoreErr(w http.ResponseWriter, err error) {
 	writeError(w, http.StatusInternalServerError, err.Error())
 }
 
+// writeSaveErr reports a failed create or update: 409 in words when the
+// name is taken, else as writeStoreErr.
+func writeSaveErr(w http.ResponseWriter, err error, what, name string) {
+	if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+		writeError(w, http.StatusConflict, fmt.Sprintf("a %s named %q already exists: pick another name", what, name))
+		return
+	}
+	writeStoreErr(w, err)
+}
+
 func randomID(prefix string) string {
 	b := make([]byte, 10)
 	_, _ = rand.Read(b)
@@ -155,9 +179,16 @@ type targetRequest struct {
 	Name     string          `json:"name"`
 	Type     string          `json:"type"`
 	Config   json.RawMessage `json:"config"`
-	SinkRef  string          `json:"sinkRef"`
-	Schedule string          `json:"schedule"`
+	SinkRef  *string         `json:"sinkRef"`
+	Schedule *string         `json:"schedule"`
 	Enabled  *bool           `json:"enabled"`
+}
+
+func deref(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
 }
 
 func (s *Server) listTargets(w http.ResponseWriter, r *http.Request) {
@@ -166,7 +197,15 @@ func (s *Server) listTargets(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, list)
+	out := make([]targetView, 0, len(list))
+	for _, t := range list {
+		v := s.viewTarget(t)
+		if run, err := s.d.Store.LatestRun(r.Context(), t.ID); err == nil {
+			v.LastRun = run
+		}
+		out = append(out, v)
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) createTarget(w http.ResponseWriter, r *http.Request) {
@@ -179,7 +218,7 @@ func (s *Server) createTarget(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "name and type are required")
 		return
 	}
-	if err := validateTargetConfig(req.Type, req.Config); err != nil {
+	if err := s.validateTargetConfig(req.Type, req.Config); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -189,16 +228,20 @@ func (s *Server) createTarget(w http.ResponseWriter, r *http.Request) {
 	}
 	t := &store.Target{
 		ID: randomID("tgt"), Name: req.Name, Type: req.Type, Config: req.Config,
-		SinkRef: req.SinkRef, Schedule: req.Schedule, Enabled: enabled,
+		SinkRef: deref(req.SinkRef), Schedule: deref(req.Schedule), Enabled: enabled,
+	}
+	if err := validateSchedule(t.Schedule); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 	if t.Config == nil {
 		t.Config = json.RawMessage("{}")
 	}
 	if err := s.d.Store.CreateTarget(r.Context(), t); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeSaveErr(w, err, "backup", t.Name)
 		return
 	}
-	writeJSON(w, http.StatusCreated, t)
+	writeJSON(w, http.StatusCreated, s.viewTarget(t))
 }
 
 func (s *Server) getTarget(w http.ResponseWriter, r *http.Request) {
@@ -207,7 +250,7 @@ func (s *Server) getTarget(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, t)
+	writeJSON(w, http.StatusOK, s.viewTarget(t))
 }
 
 func (s *Server) updateTarget(w http.ResponseWriter, r *http.Request) {
@@ -231,20 +274,29 @@ func (s *Server) updateTarget(w http.ResponseWriter, r *http.Request) {
 	if req.Config != nil {
 		existing.Config = req.Config
 	}
-	if err := validateTargetConfig(existing.Type, existing.Config); err != nil {
+	if err := s.validateTargetConfig(existing.Type, existing.Config); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	existing.SinkRef = req.SinkRef
-	existing.Schedule = req.Schedule
+	// Left out means unchanged; "" clears (default sink, manual only).
+	if req.SinkRef != nil {
+		existing.SinkRef = *req.SinkRef
+	}
+	if req.Schedule != nil {
+		if err := validateSchedule(*req.Schedule); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		existing.Schedule = *req.Schedule
+	}
 	if req.Enabled != nil {
 		existing.Enabled = *req.Enabled
 	}
 	if err := s.d.Store.UpdateTarget(r.Context(), existing); err != nil {
-		writeStoreErr(w, err)
+		writeSaveErr(w, err, "backup", existing.Name)
 		return
 	}
-	writeJSON(w, http.StatusOK, existing)
+	writeJSON(w, http.StatusOK, s.viewTarget(existing))
 }
 
 func (s *Server) deleteTarget(w http.ResponseWriter, r *http.Request) {
@@ -313,21 +365,6 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, runs)
 }
 
-// validateTargetConfig checks the parts of a target's config the API can
-// check without connecting: an ssh-path target's filter rules.
-func validateTargetConfig(typ string, cfg json.RawMessage) error {
-	if typ != store.TypeSSHPath || len(cfg) == 0 {
-		return nil
-	}
-	var c struct {
-		Filters filter.Rules `json:"filters"`
-	}
-	if err := json.Unmarshal(cfg, &c); err != nil {
-		return fmt.Errorf("config: %w", err)
-	}
-	return c.Filters.Validate()
-}
-
 // ---- sync jobs ----
 
 type syncJobRequest struct {
@@ -336,7 +373,7 @@ type syncJobRequest struct {
 	DestConfig   json.RawMessage `json:"destConfig"`
 	Filters      *filter.Rules   `json:"filters"`
 	Delete       *bool           `json:"delete"`
-	Schedule     string          `json:"schedule"`
+	Schedule     *string         `json:"schedule"`
 	Enabled      *bool           `json:"enabled"`
 }
 
@@ -344,10 +381,19 @@ type syncJobRequest struct {
 type syncJobView struct {
 	*store.SyncJob
 	Kind string `json:"kind"`
+	From string `json:"from"` // the source, in words
+	To   string `json:"to"`
 }
 
 func viewSyncJob(j *store.SyncJob) syncJobView {
-	return syncJobView{SyncJob: j, Kind: syncpkg.JobKind(j.SourceConfig, j.DestConfig)}
+	v := syncJobView{SyncJob: j, Kind: syncpkg.JobKind(j.SourceConfig, j.DestConfig)}
+	if e, err := syncpkg.ParseEndpoint(j.SourceConfig); err == nil {
+		v.From = e.String()
+	}
+	if e, err := syncpkg.ParseEndpoint(j.DestConfig); err == nil {
+		v.To = e.String()
+	}
+	return v
 }
 
 func validateSyncJob(j *store.SyncJob) error {
@@ -386,7 +432,11 @@ func (s *Server) createSyncJob(w http.ResponseWriter, r *http.Request) {
 	}
 	j := &store.SyncJob{
 		ID: randomID("sync"), Name: req.Name, SourceConfig: req.SourceConfig, DestConfig: req.DestConfig,
-		Schedule: req.Schedule, Enabled: enabled,
+		Schedule: deref(req.Schedule), Enabled: enabled,
+	}
+	if err := validateSchedule(j.Schedule); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 	if req.Filters != nil {
 		j.Filters = *req.Filters
@@ -399,7 +449,7 @@ func (s *Server) createSyncJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.d.Store.CreateSyncJob(r.Context(), j); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeSaveErr(w, err, "sync job", j.Name)
 		return
 	}
 	writeJSON(w, http.StatusCreated, viewSyncJob(j))
@@ -441,7 +491,13 @@ func (s *Server) updateSyncJob(w http.ResponseWriter, r *http.Request) {
 	if req.Delete != nil {
 		existing.Delete = *req.Delete
 	}
-	existing.Schedule = req.Schedule
+	if req.Schedule != nil {
+		if err := validateSchedule(*req.Schedule); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		existing.Schedule = *req.Schedule
+	}
 	if req.Enabled != nil {
 		existing.Enabled = *req.Enabled
 	}
@@ -450,7 +506,7 @@ func (s *Server) updateSyncJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.d.Store.UpdateSyncJob(r.Context(), existing); err != nil {
-		writeStoreErr(w, err)
+		writeSaveErr(w, err, "sync job", existing.Name)
 		return
 	}
 	writeJSON(w, http.StatusOK, viewSyncJob(existing))

@@ -62,6 +62,11 @@ rules:
   - apiGroups: [""]
     resources: [namespaces, configmaps, secrets, services, serviceaccounts, persistentvolumeclaims]
     verbs: [get, list]
+  # Pods: only read, to show which workloads use a volume and which run a
+  # database (the namespace view). Nothing is executed in them yet.
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list]
   - apiGroups: [apps]
     resources: [deployments, statefulsets, daemonsets]
     verbs: [get, list]
@@ -124,6 +129,8 @@ spec:
           env:
             - {name: BACKUP_STACK_DB, value: /data/backup-stack.db}
             - {name: BACKUP_STACK_ADDR, value: ":8481"}
+            # What the UI calls this cluster (blank kubeconfigPath).
+            - {name: BACKUP_STACK_CLUSTER_NAME, value: spark}
             - {name: HOME, value: /data}
             - {name: TMPDIR, value: /tmp}
             # Used when an ssh target/endpoint doesn't name its own.

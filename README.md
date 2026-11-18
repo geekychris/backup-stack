@@ -31,18 +31,79 @@ Every run records bytes, files, errors, duration and transfer rate.
   Kubernetes those point at the mounted `backup-stack-ssh` Secret. Host keys
   are always checked unless the config sets `insecureSkipHostKeyCheck`
   explicitly. The remote host needs a POSIX shell and GNU find.
-- **k8s-namespace** is the namespaced objects (ConfigMaps, Secrets,
-  Deployments) in one or more namespaces, read with client-go. Config:
+- **k8s-namespace** ("Kubernetes objects" in the UI) is the manifests that
+  recreate a namespace, read with client-go: ConfigMaps, Secrets, Services,
+  ServiceAccounts, PersistentVolumeClaims, Deployments, StatefulSets,
+  DaemonSets, CronJobs, Ingresses, NetworkPolicies, Roles and RoleBindings.
+  Each is saved cleaned for `kubectl apply`, with no uid, resourceVersion or
+  status, no Service cluster IPs and no claim's bound volume name. Left out
+  are objects a controller owns and recreates (a CronJob's Jobs, …),
+  `kube-root-ca.crt`, the `default` ServiceAccount and service-account token
+  Secrets. Config:
   ```json
-  {"kubeconfigPath": "", "namespaces": ["default"], "excludeKinds": []}
+  {"kubeconfigPath": "", "namespaces": ["wiki"], "excludeKinds": []}
   ```
-  A blank `kubeconfigPath` means the cluster the service runs in, through its
-  ServiceAccount. For another cluster, mount its kubeconfig from the
-  `backup-stack-kubeconfigs` Secret and give the path
-  (`/etc/backup-stack/kube/<file>`). Secrets are included by default; set
-  `excludeKinds: ["Secret"]` to leave them out. This captures object
-  manifests, not PersistentVolume data: the lab's microk8s has no CSI
-  snapshot controller.
+  Use one namespace per target: the UI creates them that way. A blank
+  `kubeconfigPath` means the cluster the service runs in, through its
+  ServiceAccount, named by `BACKUP_STACK_CLUSTER_NAME`. Any other cluster is
+  a kubeconfig file in `BACKUP_STACK_KUBE_DIR` (the `backup-stack-kubeconfigs`
+  Secret, one key per cluster, mounted at `/etc/backup-stack/kube/<cluster>`).
+  The API refuses a path that is not one of these clusters (`GET
+  /v1/clusters`). Secrets are included by default; set
+  `excludeKinds: ["Secret"]` to leave them out.
+
+  This copies **manifests, not data**. A PVC is saved as a claim, not as the
+  files on it, and a database's contents are not included. The UI's
+  namespace view lists each namespace's volumes and the databases its pods
+  run (found by image), so you can see what is still unprotected. Volume-file
+  and database-dump backups are the next step.
+
+### Every target says what it copies
+
+`GET /v1/targets` adds to each target `cluster` (the cluster name, or the
+host for ssh-path), `namespaces`, `what` ("Kubernetes objects", "Files over
+SSH"), `copies` (a sentence) and `lastRun`. The UI groups backups by cluster
+or host, then by namespace or path.
+
+### Finding what to back up
+
+- `GET /v1/clusters` lists the clusters and the object kinds a k8s target
+  copies, each with a line about what it is.
+- `GET /v1/clusters/{name}/namespaces[?namespace=]` lists every namespace
+  with object counts by kind, its PVCs (size, class, which workloads mount
+  them, and whether a database runs on them), the databases its pods run
+  (postgres, mysql, mariadb, mongodb, redis, by image or well-known port), and
+  the targets that already cover it. The UI's **What isn't backed up?** view
+  is this.
+- `GET /v1/sinks` lists the destinations (name, endpoint, bucket, prefix; no
+  keys).
+- `GET /v1/schedule?expr=` validates a cron schedule and returns its next
+  three runs. Create and update refuse an invalid schedule.
+
+`PUT /v1/targets/{id}` and `PUT /v1/sync-jobs/{id}` change only the fields
+they are sent: `{"enabled": false}` disables a target without touching its
+schedule, and `"schedule": ""` makes it manual. A name that is already taken
+is a 409 that says so.
+
+### The UI
+
+Every backup and sync job can be edited, disabled, enabled and deleted. Delete
+warns that the run history goes with it, and with it the ability to restore
+from here, and points to Disable instead. The editors have a field and an
+explanation for every setting, so there is no JSON to write:
+
+- **cluster and namespace pickers**, showing what is in the namespace and
+  whether it is already backed up;
+- **kinds to leave out**, each with a line about what it is;
+- **SSH fields**: host, port, user, directory, and the keys under
+  *advanced*;
+- **filter rules**, checked as you type, with the syntax and examples;
+- a **schedule picker**: manual, hourly, daily at, weekly on, or custom cron,
+  with the next three runs shown. New namespace backups get the next free
+  quarter hour from 03:00;
+- **the destination**, showing its endpoint and bucket;
+- for sync jobs, **each side** as a directory on a host, an S3 bucket (a
+  configured destination, or another endpoint) or a directory in the pod.
 
 cloud-stack's infra registry (`GET /v1/infra`) only *suggests* candidates
 (`GET /v1/discover`, or `backup-stack discover`). It never enrolls a target by
@@ -179,6 +240,8 @@ one concurrency limit (`BACKUP_STACK_CONCURRENCY`, default 4).
 | `BACKUP_STACK_S3_*` | shorthand for one sink named `primary` when `BACKUP_STACK_SINKS_JSON` isn't set (`_ENDPOINT`, `_BUCKET`, `_ACCESS_KEY`, `_SECRET_KEY`, `_PREFIX`, `_USE_SSL`, `_CREATE_BUCKET`) |
 | `BACKUP_STACK_SSH_KEY`, `BACKUP_STACK_SSH_KNOWN_HOSTS` | default SSH key and known_hosts for ssh targets and endpoints |
 | `BACKUP_STACK_RSYNC` | rsync binary path, or `off` (default: `rsync` on `PATH`) |
+| `BACKUP_STACK_CLUSTER_NAME` | what to call the cluster the service runs in (default `local`; `spark` in the manifest) |
+| `BACKUP_STACK_KUBE_DIR` | directory of kubeconfig files, one per other cluster, named after it (default `/etc/backup-stack/kube`) |
 | `CLOUDSTACK_URL`, `CLOUDSTACK_TOKEN` | the cloud-stack instance to discover candidates from (optional) |
 
 `GET /healthz` needs no token. It answers 200 while the store answers and 503
@@ -271,7 +334,7 @@ backup-stack discover
 
 ## Scope cuts
 
-- No PV/PVC byte-level volume backup (no CSI snapshot controller in the lab).
+- No PV/PVC volume-file backup and no database dumps yet. They are the next step: run inside the app's own pods (`tar` of a mounted volume; `pg_dump`/`mysqldump`/`mongodump` in the database container), which needs `pods/exec`.
 - No content-addressed chunk-level dedup or garbage collection.
 - No bidirectional sync or conflict resolution. Deletes propagate only with
   `delete` explicitly on.
