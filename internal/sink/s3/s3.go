@@ -72,13 +72,19 @@ func New(ctx context.Context, cfg Config) (*Sink, error) {
 	return &Sink{c: c, bucket: cfg.Bucket, prefix: prefix}, nil
 }
 
+// itemPartSize is the multipart part size for items of unknown length.
+const itemPartSize = 16 << 20
+
 func (s *Sink) itemKey(runID, path string) string { return s.prefix + runID + "/items/" + path }
 func (s *Sink) catalogKey(runID string) string    { return s.prefix + runID + "/catalog.json" }
 func (s *Sink) runPrefix(runID string) string     { return s.prefix + runID + "/" }
 
 // WriteItem implements sink.Sink.
 func (s *Sink) WriteItem(ctx context.Context, runID, path string, r io.Reader) error {
-	_, err := s.c.PutObject(ctx, s.bucket, s.itemKey(runID, path), r, -1, minio.PutObjectOptions{ContentType: "application/octet-stream"})
+	// The size is unknown, so minio-go buffers one part in memory. Its
+	// default part for an unknown size is ~512 MiB, which got the pod
+	// OOM-killed on its first backup; 16 MiB still allows ~160 GiB per item.
+	_, err := s.c.PutObject(ctx, s.bucket, s.itemKey(runID, path), r, -1, minio.PutObjectOptions{ContentType: "application/octet-stream", PartSize: itemPartSize})
 	if err != nil {
 		return fmt.Errorf("sink/s3: write item %s/%s: %w", runID, path, err)
 	}
