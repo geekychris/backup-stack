@@ -2,9 +2,14 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/geekychris/backup-stack/internal/filter"
+	"github.com/geekychris/backup-stack/internal/runstats"
 )
 
 func newTestStore(t *testing.T) *Store {
@@ -148,7 +153,7 @@ func TestStartRunRejectsConcurrent(t *testing.T) {
 	}
 
 	// Once the first run finishes, a new StartRun must succeed again.
-	if err := s.FinishRun(ctx, "r1", StateSucceeded, 0, ""); err != nil {
+	if err := s.FinishRun(ctx, "r1", StateSucceeded, 0, runstats.Stats{}, ""); err != nil {
 		t.Fatal(err)
 	}
 	third := &Run{ID: "r3", TargetID: "t1", Kind: KindIncremental, State: StateRunning}
@@ -206,5 +211,153 @@ func TestReconcileStaleRuns(t *testing.T) {
 	}
 	if len(due) != 1 || due[0].ID != "t1" {
 		t.Fatalf("due = %+v, want [t1]", due)
+	}
+}
+
+func TestRunStatsRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	start := time.Date(2026, 11, 1, 10, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return start.Add(4 * time.Second) }
+	if err := s.CreateTarget(ctx, &Target{ID: "t1", Name: "t1", Type: TypeSSHPath, Config: []byte(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.StartRun(ctx, &Run{ID: "r1", TargetID: "t1", Kind: KindFull, State: StateRunning, StartedAt: start}); err != nil {
+		t.Fatal(err)
+	}
+	st := runstats.Stats{Bytes: 4000, Files: 3}
+	st.AddErrorMsg("one")
+	if err := s.FinishRun(ctx, "r1", StateFailed, 3, st, st.Summary()); err != nil {
+		t.Fatal(err)
+	}
+	r, err := s.GetRun(ctx, "r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Stats.Bytes != 4000 || r.Stats.Files != 3 || r.Stats.Errors != 1 || len(r.Stats.ErrorSamples) != 1 {
+		t.Fatalf("stats = %+v", r.Stats)
+	}
+	if r.DurationMs != 4000 || r.RateBps != 1000 {
+		t.Fatalf("duration=%d rate=%v", r.DurationMs, r.RateBps)
+	}
+}
+
+func TestSyncJobFiltersAndRuns(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	j := &SyncJob{ID: "j1", Name: "photos", SourceConfig: []byte(`{"type":"dir","path":"/a"}`), DestConfig: []byte(`{"type":"dir","path":"/b"}`),
+		Filters: filter.Rules{{Kind: filter.Exclude, Pattern: "*.tmp"}}, Delete: true, Enabled: true, Schedule: "@every 1m"}
+	if err := s.CreateSyncJob(ctx, j); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetSyncJob(ctx, "j1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Filters) != 1 || got.Filters[0].Pattern != "*.tmp" || !got.Delete {
+		t.Fatalf("job = %+v", got)
+	}
+
+	if err := s.StartSyncRun(ctx, &SyncRun{ID: "s1", JobID: "j1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.StartSyncRun(ctx, &SyncRun{ID: "s2", JobID: "j1"}); !errors.Is(err, ErrSyncInFlight) {
+		t.Fatalf("second start: %v, want ErrSyncInFlight", err)
+	}
+	if due, _ := s.DueSyncJobs(ctx, time.Now().Add(time.Hour)); len(due) != 0 {
+		t.Fatalf("in-flight job reported due: %+v", due)
+	}
+	if err := s.FinishSyncRun(ctx, "s1", "rsync", StateSucceeded, runstats.Stats{Bytes: 10, Files: 1, Skipped: 2}, ""); err != nil {
+		t.Fatal(err)
+	}
+	runs, err := s.ListSyncRuns(ctx, "j1")
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("runs = %+v, %v", runs, err)
+	}
+	if runs[0].Method != "rsync" || runs[0].State != StateSucceeded || runs[0].Stats.Skipped != 2 {
+		t.Fatalf("run = %+v", runs[0])
+	}
+	got, _ = s.GetSyncJob(ctx, "j1")
+	if got.LastRunState != StateSucceeded || got.LastRunAt == nil {
+		t.Fatalf("job last-run not updated: %+v", got)
+	}
+}
+
+func TestListHistoryMergesBackupAndSync(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	base := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	if err := s.CreateTarget(ctx, &Target{ID: "t1", Name: "etc", Type: TypeSSHPath, Config: []byte(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateSyncJob(ctx, &SyncJob{ID: "j1", Name: "mirror"}); err != nil {
+		t.Fatal(err)
+	}
+	fin := base.Add(time.Hour + time.Second)
+	if err := s.CreateRun(ctx, &Run{ID: "r1", TargetID: "t1", Kind: KindFull, State: StateSucceeded, StartedAt: base.Add(time.Hour), FinishedAt: &fin}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.StartSyncRun(ctx, &SyncRun{ID: "s1", JobID: "j1", StartedAt: base.Add(2 * time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateRun(ctx, &Run{ID: "old", TargetID: "t1", Kind: KindFull, State: StateSucceeded, StartedAt: base.Add(-time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+
+	all, err := s.ListHistory(ctx, HistoryQuery{Since: base})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 || all[0].RunID != "s1" || all[0].Source != SourceSync || all[0].OwnerName != "mirror" ||
+		all[1].RunID != "r1" || all[1].OwnerName != "etc" || all[1].DurationMs != 1000 {
+		t.Fatalf("history = %+v %+v", all[0], all[1])
+	}
+	only, err := s.ListHistory(ctx, HistoryQuery{OwnerID: "t1"})
+	if err != nil || len(only) != 2 {
+		t.Fatalf("owner filter: %d entries, %v", len(only), err)
+	}
+	syncs, _ := s.ListHistory(ctx, HistoryQuery{Source: SourceSync})
+	if len(syncs) != 1 {
+		t.Fatalf("source filter: %d", len(syncs))
+	}
+}
+
+// A database created before run history existed gains the new columns.
+func TestOpenMigratesOldSchema(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "old.db")
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE targets (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, type TEXT NOT NULL, config TEXT NOT NULL,
+		sink_ref TEXT NOT NULL DEFAULT '', schedule TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+	CREATE TABLE runs (id TEXT PRIMARY KEY, target_id TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL, item_count INTEGER NOT NULL DEFAULT 0,
+		error TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL, finished_at TEXT);
+	CREATE TABLE sync_jobs (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, source_config TEXT NOT NULL, dest_config TEXT NOT NULL,
+		schedule TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, last_run_at TEXT, last_run_state TEXT NOT NULL DEFAULT '',
+		last_run_error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+	INSERT INTO targets VALUES ('t1','etc','ssh-path','{}','','',1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+	INSERT INTO runs (id,target_id,kind,state,started_at) VALUES ('r1','t1','full','succeeded','2026-01-01T00:00:00Z');
+	INSERT INTO sync_jobs (id,name,source_config,dest_config,created_at,updated_at) VALUES ('j1','m','{}','{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	s, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	r, err := s.GetRun(ctx, "r1")
+	if err != nil || r.Stats.Bytes != 0 {
+		t.Fatalf("old run: %+v, %v", r, err)
+	}
+	j, err := s.GetSyncJob(ctx, "j1")
+	if err != nil || j.Delete || len(j.Filters) != 0 {
+		t.Fatalf("old job: %+v, %v", j, err)
+	}
+	if err := s.Ping(ctx); err != nil {
+		t.Fatal(err)
 	}
 }

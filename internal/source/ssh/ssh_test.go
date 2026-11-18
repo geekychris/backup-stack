@@ -16,6 +16,7 @@ import (
 	xssh "golang.org/x/crypto/ssh"
 
 	"github.com/geekychris/backup-stack/internal/catalog"
+	"github.com/geekychris/backup-stack/internal/filter"
 )
 
 // fakeServer is an in-process SSH server that answers every "exec" request
@@ -199,6 +200,34 @@ func TestSSHSourceSnapshot(t *testing.T) {
 	}
 	if len(d.Added) != 0 || len(d.Deleted) != 0 {
 		t.Fatalf("expected no added/deleted, got added=%+v deleted=%v", d.Added, d.Deleted)
+	}
+}
+
+func TestSSHSourceSnapshotAppliesFilters(t *testing.T) {
+	fs := newFakeServer(t)
+	fs.setListing([]listEntry{
+		{path: "a.txt", size: 3, mtime: 1000.0},
+		{path: "cache/x.bin", size: 5, mtime: 2000.0},
+		{path: "logs/keep.log", size: 1, mtime: 2000.0},
+		{path: "logs/old.log.1", size: 1, mtime: 2000.0},
+	})
+	src := newSource(t, fs, "/data")
+	src.cfg.Filters = filter.Rules{
+		{Kind: filter.Exclude, Pattern: "cache/**"},
+		{Kind: filter.Include, Pattern: "logs/*.log"},
+		{Kind: filter.Exclude, Pattern: "logs/**"},
+	}
+	defer src.Close()
+	cat, err := src.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, it := range cat.Items {
+		got = append(got, it.Path)
+	}
+	if strings.Join(got, ",") != "a.txt,logs/keep.log" {
+		t.Fatalf("filtered items = %v", got)
 	}
 }
 

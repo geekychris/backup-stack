@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path"
 	"syscall"
@@ -31,11 +32,14 @@ import (
 
 	"github.com/geekychris/backup-stack/internal/backup"
 	"github.com/geekychris/backup-stack/internal/cloudstackinfra"
+	"github.com/geekychris/backup-stack/internal/filter"
 	"github.com/geekychris/backup-stack/internal/httpapi"
 	"github.com/geekychris/backup-stack/internal/scheduler"
 	"github.com/geekychris/backup-stack/internal/sink"
 	"github.com/geekychris/backup-stack/internal/source"
+	"github.com/geekychris/backup-stack/internal/sshconn"
 	"github.com/geekychris/backup-stack/internal/store"
+	syncpkg "github.com/geekychris/backup-stack/internal/sync"
 	"github.com/geekychris/backup-stack/internal/webui"
 )
 
@@ -121,19 +125,46 @@ func s3ConfigFromEnv(prefix string) s3Config {
 	}
 }
 
+// newSyncRunner builds the sync job runner: the system rsync unless
+// BACKUP_STACK_RSYNC is "off" (or names another binary), and s3 endpoints'
+// "sink" names resolved against the configured sinks.
+func newSyncRunner(st *store.Store, sinks map[string]s3Config) *syncpkg.Runner {
+	rsync := os.Getenv("BACKUP_STACK_RSYNC")
+	switch rsync {
+	case "off":
+		rsync = ""
+	case "":
+		if p, err := exec.LookPath("rsync"); err == nil {
+			rsync = p
+		}
+	}
+	return &syncpkg.Runner{
+		Store:     st,
+		RsyncPath: rsync,
+		Sinks: func(name string) (syncpkg.S3Config, string, error) {
+			c, ok := sinks[name]
+			if !ok {
+				return syncpkg.S3Config{}, "", fmt.Errorf("no sink configured named %q", name)
+			}
+			return syncpkg.S3Config{
+				Endpoint: c.Endpoint, Region: c.Region, Bucket: c.Bucket, AccessKey: c.AccessKey,
+				SecretKey: c.SecretKey, UseSSL: c.UseSSL, CreateBucket: c.CreateBucket,
+			}, c.Prefix, nil
+		},
+	}
+}
+
 func cloudStackClient() *cloudstackinfra.Client {
 	return cloudstackinfra.New(os.Getenv("CLOUDSTACK_URL"), os.Getenv("CLOUDSTACK_TOKEN"))
 }
 
 // ---- target Config parsing (shared by serve's BuildSource and the CLI) ----
 
+// sshTargetConfig is an ssh-path target's config: the shared SSH
+// connection fields plus the filter rules selecting what to back up.
 type sshTargetConfig struct {
-	Addr                     string `json:"addr"`
-	User                     string `json:"user"`
-	Path                     string `json:"path"`
-	PrivateKeyPath           string `json:"privateKeyPath"`
-	KnownHostsPath           string `json:"knownHostsPath"`
-	InsecureSkipHostKeyCheck bool   `json:"insecureSkipHostKeyCheck"`
+	sshconn.Config
+	Filters filter.Rules `json:"filters"`
 }
 
 type k8sTargetConfig struct {
@@ -203,12 +234,17 @@ func cmdServe(ctx context.Context, args []string) error {
 	}
 	cs := cloudStackClient()
 	runner := &backup.Runner{Store: st}
+	syncRunner := newSyncRunner(st, sinks)
+	if syncRunner.RsyncPath == "" {
+		slog.Info("backup-stack: rsync not available; directory syncs use the native copier")
+	}
 
 	apiServer := httpapi.New(httpapi.Deps{
 		Store:       st,
 		Runner:      runner,
 		BuildSource: buildSource,
 		ResolveSink: func(t *store.Target) (sink.Sink, error) { return resolveSink(t, sinks) },
+		Sync:        syncRunner,
 		Infra:       cs,
 		Token:       token,
 	})
@@ -240,6 +276,10 @@ func cmdServe(ctx context.Context, args []string) error {
 				return err
 			}
 			_, err = runner.RunIncremental(ctx, t.ID, src, sk)
+			return err
+		},
+		Sync: func(ctx context.Context, j *store.SyncJob) error {
+			_, err := syncRunner.Run(ctx, j)
 			return err
 		},
 		Logger: slog.Default(),
@@ -407,15 +447,21 @@ func cmdSync(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	result, err := runSyncJob(ctx, j)
+	sinks, err := sinksConfig()
 	if err != nil {
-		_ = st.FinishSyncJob(ctx, j.ID, store.StateFailed, err.Error())
 		return err
 	}
-	if err := st.FinishSyncJob(ctx, j.ID, store.StateSucceeded, ""); err != nil {
+	run, err := newSyncRunner(st, sinks).Run(ctx, j)
+	if err != nil {
 		return err
 	}
-	return printJSON(result)
+	if err := printJSON(run); err != nil {
+		return err
+	}
+	if run.State != store.StateSucceeded {
+		return fmt.Errorf("sync %s: %s", run.State, run.Error)
+	}
+	return nil
 }
 
 // ---- restore ----

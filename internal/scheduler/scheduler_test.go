@@ -186,3 +186,33 @@ func TestSchedulerWaitBlocksUntilDispatchedRunsFinish(t *testing.T) {
 		t.Fatal("Wait did not return within 2s of the dispatched run finishing")
 	}
 }
+
+func TestSchedulerDispatchesDueSyncJobs(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	if err := st.CreateSyncJob(ctx, &store.SyncJob{ID: "j1", Name: "j1", Schedule: "@every 1m", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateSyncJob(ctx, &store.SyncJob{ID: "manual", Name: "manual", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan string, 4)
+	sched := &Scheduler{
+		Store: st,
+		Run:   func(context.Context, *store.Target) error { return nil },
+		Sync: func(_ context.Context, j *store.SyncJob) error {
+			got <- j.ID
+			return nil
+		},
+	}
+	sched.Poll(ctx)
+	sched.Wait()
+	close(got)
+	var ids []string
+	for id := range got {
+		ids = append(ids, id)
+	}
+	if len(ids) != 1 || ids[0] != "j1" {
+		t.Fatalf("dispatched %v, want [j1]", ids)
+	}
+}

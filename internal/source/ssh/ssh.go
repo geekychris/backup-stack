@@ -19,11 +19,12 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/geekychris/backup-stack/internal/catalog"
+	"github.com/geekychris/backup-stack/internal/filter"
 )
 
 // catCommandPrefix begins the remote command Open runs to stream one file's
 // content; a test fake server matches on it to tell a cat from a listing.
-const catCommandPrefix = "cat '"
+const catCommandPrefix = "cat '" // "cat " + quoteSingle(path)
 
 // Config configures a Source.
 type Config struct {
@@ -37,6 +38,9 @@ type Config struct {
 	Path string
 	// DialTimeout bounds the TCP+SSH handshake. Default 15s.
 	DialTimeout time.Duration
+	// Filters select which files (by path relative to Path) are backed up;
+	// a file they exclude is simply not part of the target's state.
+	Filters filter.Rules
 }
 
 // Source backs up a directory tree on a remote host over SSH.
@@ -152,6 +156,9 @@ func (s *Source) Snapshot(ctx context.Context) (catalog.Catalog, error) {
 		if len(fields) != 3 {
 			continue
 		}
+		if !s.cfg.Filters.Included(fields[0]) {
+			continue
+		}
 		size, _ := strconv.ParseInt(fields[1], 10, 64)
 		cat.Items = append(cat.Items, catalog.Item{
 			Path:        fields[0],
@@ -179,7 +186,9 @@ func (s *Source) Open(ctx context.Context, p string) (io.ReadCloser, error) {
 		sess.Close()
 		return nil, err
 	}
-	if err := sess.Start(catCommandPrefix + full + "'"); err != nil {
+	// "cat " + a single-quoted path, so a quote in a file name can't break
+	// out of it.
+	if err := sess.Start("cat " + quoteSingle(full)); err != nil {
 		sess.Close()
 		return nil, fmt.Errorf("source/ssh: open %s: %w", p, err)
 	}

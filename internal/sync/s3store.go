@@ -5,10 +5,26 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"strings"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 )
+
+// ObjectInfo is one object's key and size, as an ObjectStore lists it.
+type ObjectInfo struct {
+	Key  string
+	Size int64
+}
+
+// ObjectStore is the object-storage surface an S3Tree needs; S3Store
+// implements it over minio-go, tests over a map.
+type ObjectStore interface {
+	List(ctx context.Context, prefix string) ([]ObjectInfo, error)
+	Get(ctx context.Context, key string) (io.ReadCloser, error)
+	Put(ctx context.Context, key string, r io.Reader, size int64) error
+	Delete(ctx context.Context, key string) error
+}
 
 // S3Config configures an S3Store, one side of a sync (source or dest).
 type S3Config struct {
@@ -86,11 +102,64 @@ func (s *S3Store) Put(ctx context.Context, key string, r io.Reader, size int64) 
 	return nil
 }
 
-// Delete implements ObjectStore. Syncer itself never calls this; it exists
-// so S3Store satisfies the interface other callers (retention pruning) use.
+// Delete implements ObjectStore. Sync only calls it for a job with Delete
+// set.
 func (s *S3Store) Delete(ctx context.Context, key string) error {
 	if err := s.c.RemoveObject(ctx, s.bucket, key, minio.RemoveObjectOptions{}); err != nil {
 		return fmt.Errorf("sync/s3: delete %s: %w", key, err)
 	}
 	return nil
 }
+
+// S3Tree is a key prefix in a bucket, as a Tree.
+type S3Tree struct {
+	Store  ObjectStore
+	Prefix string
+}
+
+var _ Tree = (*S3Tree)(nil)
+
+func (t *S3Tree) dirPrefix() string {
+	p := strings.Trim(t.Prefix, "/")
+	if p == "" {
+		return ""
+	}
+	return p + "/"
+}
+
+// List implements Tree. S3 objects carry no comparable modification time,
+// so a changed object is detected by size only.
+func (t *S3Tree) List(ctx context.Context) (map[string]Entry, error) {
+	objs, err := t.Store.List(ctx, t.dirPrefix())
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]Entry, len(objs))
+	p := t.dirPrefix()
+	for _, o := range objs {
+		rel := strings.TrimPrefix(o.Key, p)
+		if rel == "" || strings.HasSuffix(rel, "/") {
+			continue
+		}
+		out[rel] = Entry{Size: o.Size}
+	}
+	return out, nil
+}
+
+// Open implements Tree.
+func (t *S3Tree) Open(ctx context.Context, rel string) (io.ReadCloser, error) {
+	return t.Store.Get(ctx, t.dirPrefix()+rel)
+}
+
+// Write implements Tree.
+func (t *S3Tree) Write(ctx context.Context, rel string, r io.Reader, e Entry) error {
+	return t.Store.Put(ctx, t.dirPrefix()+rel, r, e.Size)
+}
+
+// Remove implements Tree.
+func (t *S3Tree) Remove(ctx context.Context, rel string) error {
+	return t.Store.Delete(ctx, t.dirPrefix()+rel)
+}
+
+// Close implements Tree.
+func (t *S3Tree) Close() error { return nil }

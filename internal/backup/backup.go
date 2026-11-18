@@ -16,9 +16,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/geekychris/backup-stack/internal/catalog"
+	"github.com/geekychris/backup-stack/internal/runstats"
 	"github.com/geekychris/backup-stack/internal/sink"
 	"github.com/geekychris/backup-stack/internal/source"
 	"github.com/geekychris/backup-stack/internal/store"
@@ -50,10 +52,17 @@ func (r *Runner) newRunID() string {
 // done must still be flipped out of state "running" even if the caller's
 // ctx was canceled mid-run (e.g. by a shutdown), or its row blocks that
 // target's schedule forever — see store.DueTargets.
-func (r *Runner) finishRun(id, state string, itemCount int, errMsg string) error {
+func (r *Runner) finishRun(id, state string, itemCount int, st runstats.Stats, errMsg string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return r.Store.FinishRun(ctx, id, state, itemCount, errMsg)
+	return r.Store.FinishRun(ctx, id, state, itemCount, st, errMsg)
+}
+
+// fail records a failed run: the error counts in its stats alongside
+// whatever had been written before it.
+func (r *Runner) fail(id string, st runstats.Stats, err error) {
+	st.AddError(err)
+	_ = r.finishRun(id, store.StateFailed, 0, st, err.Error())
 }
 
 // RunFull captures everything src currently reports: every item's content
@@ -67,15 +76,17 @@ func (r *Runner) RunFull(ctx context.Context, targetID string, src source.Source
 	if err := r.Store.StartRun(ctx, run); err != nil {
 		return nil, fmt.Errorf("backup: start run: %w", err)
 	}
-	if err := writeItems(ctx, run.ID, src, sk, snap.Items); err != nil {
-		_ = r.finishRun(run.ID, store.StateFailed, 0, err.Error())
+	st, err := writeItems(ctx, run.ID, src, sk, snap.Items)
+	if err != nil {
+		r.fail(run.ID, st, err)
 		return nil, err
 	}
 	if err := sk.WriteCatalog(ctx, run.ID, snap); err != nil {
-		_ = r.finishRun(run.ID, store.StateFailed, 0, err.Error())
-		return nil, fmt.Errorf("backup: write catalog: %w", err)
+		err = fmt.Errorf("backup: write catalog: %w", err)
+		r.fail(run.ID, st, err)
+		return nil, err
 	}
-	if err := r.finishRun(run.ID, store.StateSucceeded, len(snap.Items), ""); err != nil {
+	if err := r.finishRun(run.ID, store.StateSucceeded, len(snap.Items), st, ""); err != nil {
 		return nil, err
 	}
 	return r.Store.GetRun(ctx, run.ID)
@@ -110,36 +121,62 @@ func (r *Runner) RunIncremental(ctx context.Context, targetID string, src source
 	if err := r.Store.StartRun(ctx, run); err != nil {
 		return nil, fmt.Errorf("backup: start run: %w", err)
 	}
-	if err := writeItems(ctx, run.ID, src, sk, deltaCat.Items); err != nil {
-		_ = r.finishRun(run.ID, store.StateFailed, 0, err.Error())
+	st, err := writeItems(ctx, run.ID, src, sk, deltaCat.Items)
+	if err != nil {
+		r.fail(run.ID, st, err)
 		return nil, err
 	}
-	if err := sk.WriteCatalog(ctx, run.ID, deltaCat); err != nil {
-		_ = r.finishRun(run.ID, store.StateFailed, 0, err.Error())
-		return nil, fmt.Errorf("backup: write catalog: %w", err)
+	// What an incremental didn't need to capture again.
+	st.Skipped = len(snap.Items) - len(deltaCat.Items)
+	if st.Skipped < 0 {
+		st.Skipped = 0
 	}
-	if err := r.finishRun(run.ID, store.StateSucceeded, len(deltaCat.Items), ""); err != nil {
+	if err := sk.WriteCatalog(ctx, run.ID, deltaCat); err != nil {
+		err = fmt.Errorf("backup: write catalog: %w", err)
+		r.fail(run.ID, st, err)
+		return nil, err
+	}
+	if err := r.finishRun(run.ID, store.StateSucceeded, len(deltaCat.Items), st, ""); err != nil {
 		return nil, err
 	}
 	return r.Store.GetRun(ctx, run.ID)
 }
 
-func writeItems(ctx context.Context, runID string, src source.Source, sk sink.Sink, items []catalog.Item) error {
+// writeItems copies each item from src to sk, counting files and bytes. It
+// stops at the first error: a backup that silently skipped a file would
+// restore an incomplete state, so a failed item fails the run (the stats
+// still say how far it got).
+func writeItems(ctx context.Context, runID string, src source.Source, sk sink.Sink, items []catalog.Item) (runstats.Stats, error) {
+	var st runstats.Stats
 	for _, it := range items {
 		rc, err := src.Open(ctx, it.Path)
 		if err != nil {
-			return fmt.Errorf("backup: open %s: %w", it.Path, err)
+			return st, fmt.Errorf("backup: open %s: %w", it.Path, err)
 		}
-		writeErr := sk.WriteItem(ctx, runID, it.Path, rc)
+		cr := &countingReader{r: rc}
+		writeErr := sk.WriteItem(ctx, runID, it.Path, cr)
 		closeErr := rc.Close()
+		st.Bytes += cr.n
 		if writeErr != nil {
-			return fmt.Errorf("backup: write %s: %w", it.Path, writeErr)
+			return st, fmt.Errorf("backup: write %s: %w", it.Path, writeErr)
 		}
 		if closeErr != nil {
-			return fmt.Errorf("backup: close %s: %w", it.Path, closeErr)
+			return st, fmt.Errorf("backup: close %s: %w", it.Path, closeErr)
 		}
+		st.Files++
 	}
-	return nil
+	return st, nil
+}
+
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
 }
 
 // chain returns a target's runs from the nearest successful full run at or
