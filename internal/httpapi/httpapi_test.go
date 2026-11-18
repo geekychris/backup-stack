@@ -93,7 +93,7 @@ func doJSON(t *testing.T, s *Server, method, path, token string, body any) *http
 func TestCreateAndListTargets(t *testing.T) {
 	s := newTestServer(t)
 	rec := doJSON(t, s, http.MethodPost, "/v1/targets", testToken, targetRequest{
-		Name: "spark-etc", Type: store.TypeSSHPath, Config: json.RawMessage(`{"host":"spark","path":"/etc"}`),
+		Name: "spark-etc", Type: store.TypeSSHPath, Config: json.RawMessage(`{"addr":"spark:22","path":"/etc"}`),
 	})
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create status = %d, body = %s", rec.Code, rec.Body.String())
@@ -122,7 +122,7 @@ func TestCreateAndListTargets(t *testing.T) {
 func TestRunNow(t *testing.T) {
 	s := newTestServer(t)
 	rec := doJSON(t, s, http.MethodPost, "/v1/targets", testToken, targetRequest{
-		Name: "t1", Type: store.TypeSSHPath, Config: json.RawMessage(`{}`),
+		Name: "t1", Type: store.TypeSSHPath, Config: json.RawMessage(`{"addr":"h:22","path":"/x"}`),
 	})
 	var created store.Target
 	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
@@ -157,7 +157,7 @@ func TestRunNow(t *testing.T) {
 func TestRunNowConflictWhenInFlight(t *testing.T) {
 	s := newTestServer(t)
 	rec := doJSON(t, s, http.MethodPost, "/v1/targets", testToken, targetRequest{
-		Name: "t1", Type: store.TypeSSHPath, Config: json.RawMessage(`{}`),
+		Name: "t1", Type: store.TypeSSHPath, Config: json.RawMessage(`{"addr":"h:22","path":"/x"}`),
 	})
 	var created store.Target
 	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
@@ -214,7 +214,7 @@ func TestSyncJobValidation(t *testing.T) {
 		}
 	}
 	if rec := doJSON(t, s, http.MethodPost, "/v1/targets", testToken, targetRequest{
-		Name: "t", Type: store.TypeSSHPath, Config: json.RawMessage(`{"filters":[{"kind":"exclude","pattern":""}]}`),
+		Name: "t", Type: store.TypeSSHPath, Config: json.RawMessage(`{"addr":"h:22","path":"/x","filters":[{"kind":"exclude","pattern":""}]}`),
 	}); rec.Code != http.StatusBadRequest {
 		t.Errorf("target with empty filter pattern: %d", rec.Code)
 	}
@@ -260,7 +260,7 @@ func TestSyncJobRunHistoryAndStats(t *testing.T) {
 	}
 
 	// A backup run shows up in the same history.
-	rec = doJSON(t, s, http.MethodPost, "/v1/targets", testToken, targetRequest{Name: "t1", Type: store.TypeSSHPath, Config: json.RawMessage(`{}`)})
+	rec = doJSON(t, s, http.MethodPost, "/v1/targets", testToken, targetRequest{Name: "t1", Type: store.TypeSSHPath, Config: json.RawMessage(`{"addr":"h:22","path":"/x"}`)})
 	var tgt store.Target
 	_ = json.Unmarshal(rec.Body.Bytes(), &tgt)
 	if rec := doJSON(t, s, http.MethodPost, "/v1/targets/"+tgt.ID+":run", testToken, nil); rec.Code != http.StatusCreated {
