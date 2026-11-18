@@ -7,6 +7,7 @@ package ssh
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -227,6 +228,11 @@ func (r *sessionReader) Close() error {
 		<-waitDone
 		return r.ctx.Err()
 	case <-waitDone:
-		return r.sess.Close()
+		// After Wait the remote side has closed the channel, so Close
+		// reports io.EOF from a real sshd; that is not a failure.
+		if err := r.sess.Close(); err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+		return nil
 	}
 }
